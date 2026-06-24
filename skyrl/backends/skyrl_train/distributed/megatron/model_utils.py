@@ -265,6 +265,183 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         return grad_input, None, None, None, None, None, None
 
 
+def _process_group_world_size(group: Optional[torch.distributed.ProcessGroup]) -> int:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 1
+    return torch.distributed.get_world_size(group)
+
+
+class FusedLMHeadDistributedLogprob(torch.autograd.Function):
+    """Compute distributed token logprobs from hidden states and LM-head weight.
+
+    This fuses the LM-head projection with logprob backward at the autograd
+    boundary. Backward recomputes one sequence chunk at a time and streams the
+    logits gradient directly into hidden-state and LM-head weight gradients,
+    avoiding the full fp32 ``[batch, sequence, vocab/tp]`` logits-gradient
+    tensor allocated by ``ChunkedDistributedLogprob.backward``.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        hidden_states: torch.Tensor,
+        output_weight: torch.Tensor,
+        target: torch.Tensor,
+        vocab_start_index: int,
+        vocab_end_index: int,
+        chunk_size: int,
+        tp_group: torch.distributed.ProcessGroup,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
+        masked_target = target - vocab_start_index
+        masked_target[target_mask] = 0
+
+        seq_size = int(hidden_states.shape[1])
+        num_chunks = (seq_size + chunk_size - 1) // chunk_size
+        all_log_probs = []
+
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
+
+            hidden_chunk = hidden_states[:, chunk_start:chunk_end, :]
+            matmul_hidden = hidden_chunk
+            if matmul_hidden.dtype != output_weight.dtype:
+                matmul_hidden = matmul_hidden.to(output_weight.dtype)
+            logits = torch.matmul(matmul_hidden, output_weight.t()).to(dtype=torch.float32)
+            if temperature != 1.0:
+                logits.div_(temperature)
+
+            log_probs = _compute_distributed_log_softmax(logits, group=tp_group)
+
+            log_probs = torch.gather(log_probs, -1, masked_target[:, chunk_start:chunk_end].unsqueeze(-1)).squeeze(-1)
+            log_probs[target_mask[:, chunk_start:chunk_end]] = 0.0
+
+            torch.distributed.all_reduce(
+                log_probs,
+                op=torch.distributed.ReduceOp.SUM,
+                group=tp_group,
+            )
+
+            all_log_probs.append(log_probs)
+
+        log_probs = torch.cat(all_log_probs, dim=1)
+
+        ctx.save_for_backward(hidden_states, output_weight, target_mask, masked_target)
+        ctx.chunk_size = chunk_size
+        ctx.tp_group = tp_group
+        ctx.temperature = float(temperature)
+        ctx.main_grad = getattr(output_weight, "main_grad", None)
+
+        return log_probs
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        *grad_outputs: torch.Tensor,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], None, None, None, None, None, None]:
+        grad_output = grad_outputs[0]
+        hidden_states, output_weight, target_mask, masked_target = ctx.saved_tensors
+        chunk_size = ctx.chunk_size
+        tp_group = ctx.tp_group
+        temperature = ctx.temperature
+        main_grad = ctx.main_grad
+
+        batch_size = int(hidden_states.shape[0])
+        seq_size = int(hidden_states.shape[1])
+        partition_vocab_size = int(output_weight.shape[0])
+        num_chunks = (seq_size + chunk_size - 1) // chunk_size
+
+        needs_hidden_grad = ctx.needs_input_grad[0]
+        needs_weight_grad = ctx.needs_input_grad[1]
+        grad_hidden = torch.empty_like(hidden_states) if needs_hidden_grad else None
+        grad_weight = None
+
+        if needs_weight_grad:
+            if main_grad is not None:
+                output_weight.main_grad = main_grad
+                grad_weight_target = main_grad
+            else:
+                grad_weight = torch.zeros_like(output_weight)
+                grad_weight_target = grad_weight
+        else:
+            grad_weight_target = None
+
+        tp_world_size = _process_group_world_size(tp_group)
+
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
+            chunk_len = chunk_end - chunk_start
+
+            hidden_chunk = hidden_states[:, chunk_start:chunk_end, :]
+            matmul_hidden = hidden_chunk
+            if matmul_hidden.dtype != output_weight.dtype:
+                matmul_hidden = matmul_hidden.to(output_weight.dtype)
+            logits = torch.matmul(matmul_hidden, output_weight.t()).to(dtype=torch.float32)
+            if temperature != 1.0:
+                logits.div_(temperature)
+
+            softmax_output = _compute_distributed_log_softmax(
+                logits,
+                group=tp_group,
+            ).exp()
+
+            chunk_target_mask = target_mask[:, chunk_start:chunk_end]
+            chunk_masked_target = masked_target[:, chunk_start:chunk_end]
+            chunk_grad_output = grad_output[:, chunk_start:chunk_end]
+
+            row = torch.arange(batch_size, device=softmax_output.device).view(-1, 1).expand(-1, chunk_len).reshape(-1)
+            col = torch.arange(chunk_len, device=softmax_output.device).expand(batch_size, -1).reshape(-1)
+            flat_idx = (row * chunk_len + col) * partition_vocab_size
+
+            valid_mask = ~chunk_target_mask
+            flat_chosen = flat_idx.masked_select(valid_mask.reshape(-1)) + chunk_masked_target.masked_select(valid_mask)
+
+            grad_logits = softmax_output.neg_()
+            grad_logits.mul_(chunk_grad_output.unsqueeze(-1))
+            grad_output_selected = chunk_grad_output.masked_select(valid_mask)
+            grad_logits.view(-1).scatter_add_(0, flat_chosen, grad_output_selected)
+
+            if temperature != 1.0:
+                grad_logits.div_(temperature)
+
+            grad_logits_2d = grad_logits.reshape(-1, partition_vocab_size)
+            hidden_2d = hidden_chunk.reshape(-1, hidden_chunk.shape[-1])
+
+            if needs_hidden_grad:
+                dgrad_logits = grad_logits_2d
+                if dgrad_logits.dtype != output_weight.dtype:
+                    dgrad_logits = dgrad_logits.to(output_weight.dtype)
+                grad_hidden_chunk = torch.matmul(dgrad_logits, output_weight)
+                if tp_world_size > 1:
+                    torch.distributed.all_reduce(grad_hidden_chunk, group=tp_group)
+                if grad_hidden_chunk.dtype != hidden_states.dtype:
+                    grad_hidden_chunk = grad_hidden_chunk.to(hidden_states.dtype)
+                grad_hidden[:, chunk_start:chunk_end, :].copy_(grad_hidden_chunk.view_as(hidden_chunk))
+
+            if grad_weight_target is not None:
+                wgrad_logits = grad_logits_2d.t()
+                wgrad_hidden = hidden_2d
+                if wgrad_logits.dtype != grad_weight_target.dtype:
+                    wgrad_logits = wgrad_logits.to(grad_weight_target.dtype)
+                if wgrad_hidden.dtype != grad_weight_target.dtype:
+                    wgrad_hidden = wgrad_hidden.to(grad_weight_target.dtype)
+                grad_weight_target.addmm_(wgrad_logits, wgrad_hidden)
+
+        if main_grad is not None:
+            grad_weight = None
+            if hasattr(output_weight, "grad_added_to_main_grad"):
+                if getattr(output_weight, "zero_out_wgrad", False):
+                    grad_weight = torch.zeros_like(output_weight)
+                else:
+                    grad_weight = torch.empty_like(output_weight)
+                output_weight.grad_added_to_main_grad = True
+
+        return grad_hidden, grad_weight, None, None, None, None, None, None
+
+
 def from_parallel_logits_to_logprobs(
     vocab_parallel_logits: torch.Tensor,
     target: torch.Tensor,
@@ -342,6 +519,119 @@ def from_parallel_logits_to_logprobs(
         logprobs = logprobs[:, :-pad_len]
 
     return logprobs[:, :-1]
+
+
+def from_fused_lm_head_to_logprobs_packed_sequences(
+    hidden_states: torch.Tensor,
+    output_weight: torch.Tensor,
+    target: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    unpacked_seqlen: int,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    group: torch.distributed.ProcessGroup,
+    chunk_size: int,
+    temperature: float = 1.0,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    sub_seq_lengths: Optional[list[list[int]]] = None,
+) -> torch.Tensor:
+    """Get packed token logprobs from hidden states without full logits grad.
+
+    ``hidden_states`` is expected in ``[1, T // CP, hidden]`` order. The
+    returned tensor follows ``from_parallel_logits_to_logprobs_packed_sequences``:
+    ``[batch, unpacked_seqlen - 1]`` with one next-token logprob per valid
+    prompt/response token position.
+    """
+    hidden_states = hidden_states.squeeze(0)
+    target = target.squeeze(0)
+
+    batch_size = len(sub_seq_lengths) if sub_seq_lengths is not None else cu_seqlens_padded.shape[0] - 1
+    cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
+    cp_rank = 0 if cp_group is None else torch.distributed.get_rank(cp_group)
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device=target.device, dtype=torch.bool)
+
+    with torch.profiler.record_function("skyrl/logprob/packed_target_roll"):
+        cu_seqlens_padded, _, seq_indices, seq_offsets, seq_lens_padded = _packed_sequence_indices(
+            cu_seqlens_padded, target.shape[0], target.device
+        )
+
+        next_offsets = torch.remainder(seq_offsets + 1, seq_lens_padded[seq_indices])
+        rolled_targets_full = target[cu_seqlens_padded[seq_indices] + next_offsets]
+        if cp_size > 1:
+            cp_rank_for_token, local_indices = _packed_cp_rank_and_local_indices(
+                cu_seqlens_padded, seq_indices, seq_offsets, seq_lens_padded, cp_size
+            )
+            rolled_targets = torch.empty(target.shape[0] // cp_size, dtype=target.dtype, device=target.device)
+            current_rank_mask = cp_rank_for_token == cp_rank
+            rolled_targets[local_indices[current_rank_mask]] = rolled_targets_full[current_rank_mask]
+        else:
+            rolled_targets = rolled_targets_full
+
+    rolled_targets = rolled_targets.unsqueeze(0)
+    hidden_states = hidden_states.unsqueeze(0)
+
+    seq_len_local = hidden_states.shape[1]
+    resolved_chunk_size = min(int(chunk_size), int(seq_len_local))
+    with torch.profiler.record_function("skyrl/logprob/fused_lm_head_distributed_logprob"):
+        probs: torch.Tensor = FusedLMHeadDistributedLogprob.apply(  # type: ignore
+            hidden_states,
+            output_weight,
+            rolled_targets,
+            vocab_start_index,
+            vocab_end_index,
+            resolved_chunk_size,
+            group,
+            temperature,
+        ).contiguous()
+
+    probs = probs.squeeze(0)
+
+    if probs.dim() != 1:
+        raise ValueError(
+            f"Expected probs to be 1D after squeezing, but got shape {probs.shape}. "
+            f"Original shape before squeeze: {probs.unsqueeze(0).shape}"
+        )
+
+    if cp_size > 1:
+        with torch.profiler.record_function("skyrl/logprob/cp_allgather_packed"):
+            probs = allgather_cp_sharded_packed_tensor(probs, cu_seqlens_padded, cp_group)
+
+    with torch.profiler.record_function("skyrl/logprob/scatter_unpacked"):
+        out_logprobs = torch.zeros((batch_size, unpacked_seqlen - 1), dtype=probs.dtype, device=probs.device)
+        _, _, seq_indices, seq_offsets, seq_lens_padded = _packed_sequence_indices(
+            cu_seqlens_padded, probs.shape[0], probs.device
+        )
+
+        if sub_seq_lengths is not None:
+            row_indices, row_offsets, seq_lens = _packed_subseq_row_indices_offsets_and_lens(
+                cu_seqlens_padded, sub_seq_lengths, probs.device
+            )
+            valid_counts = torch.clamp(seq_lens - 1, min=0)
+            packed_mask = seq_offsets < valid_counts[seq_indices]
+            output_cols = row_offsets[seq_indices[packed_mask]] + seq_offsets[packed_mask]
+            output_rows = row_indices[seq_indices[packed_mask]]
+            output_in_bounds = output_cols < unpacked_seqlen - 1
+            out_logprobs[output_rows[output_in_bounds], output_cols[output_in_bounds]] = probs[packed_mask][
+                output_in_bounds
+            ]
+            return out_logprobs
+
+        if attention_mask is not None:
+            seq_lens = attention_mask.sum(dim=1, dtype=torch.long)
+            token_ordinals = attention_mask.to(torch.long).cumsum(dim=1)
+            output_mask = attention_mask[:, :-1] & (token_ordinals[:, :-1] < seq_lens.unsqueeze(1))
+            valid_counts = torch.clamp(seq_lens - 1, min=0)
+            packed_mask = seq_offsets < valid_counts[seq_indices]
+            out_logprobs[output_mask] = probs[packed_mask]
+            return out_logprobs
+
+        valid_counts = torch.clamp(seq_lens_padded - 1, min=0)
+        packed_mask = (seq_offsets < valid_counts[seq_indices]) & (seq_offsets < unpacked_seqlen - 1)
+        out_logprobs[seq_indices[packed_mask], seq_offsets[packed_mask]] = probs[packed_mask]
+
+    return out_logprobs
 
 
 def from_parallel_logits_to_logprobs_packed_sequences(
@@ -491,6 +781,145 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     return out_logprobs
 
 
+def _packed_action_weights_for_entropy(
+    cu_seqlens_padded: torch.Tensor,
+    unpacked_seqlen: int,
+    num_actions: int,
+    attention_mask: torch.Tensor,
+    loss_mask: Optional[torch.Tensor],
+    dtype: torch.dtype,
+    device: torch.device,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    sub_seq_lengths: Optional[list[list[int]]] = None,
+    local_tokens: Optional[int] = None,
+) -> tuple[torch.Tensor, int]:
+    attention_mask = attention_mask.to(device=device, dtype=torch.bool)
+    cu_seqlens_padded = cu_seqlens_padded.to(device=device, dtype=torch.long)
+    batch_size = attention_mask.shape[0]
+
+    action_weights = torch.zeros((batch_size, unpacked_seqlen - 1), dtype=dtype, device=device)
+    if loss_mask is None:
+        action_weights[:, -num_actions:] = 1.0
+    else:
+        action_weights[:, -num_actions:] = loss_mask.to(device=device, dtype=dtype)
+
+    packed_weights = torch.zeros((int(cu_seqlens_padded[-1].item()),), dtype=dtype, device=device)
+    if sub_seq_lengths is not None:
+        _, _, seq_indices, seq_offsets, _ = _packed_sequence_indices(cu_seqlens_padded, packed_weights.shape[0], device)
+        row_indices, row_offsets, seq_lens = _packed_subseq_row_indices_offsets_and_lens(
+            cu_seqlens_padded, sub_seq_lengths, device
+        )
+        valid_counts = torch.clamp(seq_lens - 1, min=0)
+        packed_mask = seq_offsets < valid_counts[seq_indices]
+        output_cols = row_offsets[seq_indices[packed_mask]] + seq_offsets[packed_mask]
+        output_rows = row_indices[seq_indices[packed_mask]]
+        output_in_bounds = output_cols < action_weights.shape[1]
+        packed_weights[torch.arange(packed_weights.shape[0], device=device)[packed_mask][output_in_bounds]] = (
+            action_weights[output_rows[output_in_bounds], output_cols[output_in_bounds]]
+        )
+    else:
+        seq_lens = attention_mask.sum(dim=1, dtype=torch.long)
+        token_ordinals = attention_mask.to(torch.long).cumsum(dim=1)
+        output_mask = attention_mask[:, :-1] & (token_ordinals[:, :-1] < seq_lens.unsqueeze(1))
+
+        token_offsets = token_ordinals - 1
+        packed_indices = cu_seqlens_padded[:-1].unsqueeze(1) + token_offsets
+        packed_weights[packed_indices[:, :-1][output_mask]] = action_weights[output_mask]
+
+    cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
+    if cp_size > 1:
+        if local_tokens is None:
+            raise ValueError("local_tokens is required when cp_group has world size > 1")
+        cp_rank = torch.distributed.get_rank(cp_group)
+        _, _, seq_indices, seq_offsets, seq_lens_padded = _packed_sequence_indices(
+            cu_seqlens_padded, packed_weights.shape[0], device
+        )
+        cp_rank_for_token, local_indices = _packed_cp_rank_and_local_indices(
+            cu_seqlens_padded, seq_indices, seq_offsets, seq_lens_padded, cp_size
+        )
+        local_weights = torch.zeros((int(local_tokens),), dtype=dtype, device=device)
+        current_rank_mask = cp_rank_for_token == cp_rank
+        local_weights[local_indices[current_rank_mask]] = packed_weights[current_rank_mask]
+    else:
+        local_weights = packed_weights
+
+    return local_weights, cp_size
+
+
+@torch.no_grad()
+def vocab_parallel_entropy_from_fused_lm_head_packed_sequences(
+    hidden_states: torch.Tensor,
+    output_weight: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    unpacked_seqlen: int,
+    num_actions: int,
+    attention_mask: torch.Tensor,
+    loss_mask: Optional[torch.Tensor],
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    sub_seq_lengths: Optional[list[list[int]]] = None,
+    chunk_size: Optional[int] = 0,
+    chunk_memory_mb: int = 512,
+    temperature: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute packed action-token entropy from hidden states and LM-head weight."""
+    device = hidden_states.device
+    dtype = hidden_states.dtype
+
+    local_weights, cp_size = _packed_action_weights_for_entropy(
+        cu_seqlens_padded=cu_seqlens_padded,
+        unpacked_seqlen=unpacked_seqlen,
+        num_actions=num_actions,
+        attention_mask=attention_mask,
+        loss_mask=loss_mask,
+        dtype=dtype,
+        device=device,
+        cp_group=cp_group,
+        sub_seq_lengths=sub_seq_lengths,
+        local_tokens=int(hidden_states.shape[-2]),
+    )
+
+    seq_len = int(hidden_states.shape[-2])
+    if seq_len <= 0:
+        local_entropy_sum = hidden_states.new_zeros(())
+    else:
+        if chunk_size is None:
+            resolved_chunk_size = seq_len
+        elif chunk_size > 0:
+            resolved_chunk_size = min(int(chunk_size), seq_len)
+        else:
+            budget_bytes = int(chunk_memory_mb) * 1024 * 1024
+            bytes_per_token = int(output_weight.shape[0]) * hidden_states.element_size() * 4
+            resolved_chunk_size = max(1, min(seq_len, budget_bytes // max(1, bytes_per_token)))
+            resolved_chunk_size = _floor_power_of_two(resolved_chunk_size)
+
+        local_entropy_sum = hidden_states.new_zeros(())
+        for start in range(0, seq_len, resolved_chunk_size):
+            end = min(start + resolved_chunk_size, seq_len)
+            weight_chunk = local_weights[start:end]
+            if torch.count_nonzero(weight_chunk).item() == 0:
+                continue
+            matmul_hidden = hidden_states[:, start:end, :]
+            if matmul_hidden.dtype != output_weight.dtype:
+                matmul_hidden = matmul_hidden.to(output_weight.dtype)
+            logits = torch.matmul(matmul_hidden, output_weight.t()).to(dtype=torch.float32)
+            if temperature != 1.0:
+                logits.div_(temperature)
+            entropy_chunk = _VocabParallelEntropy.apply(logits).squeeze(0)
+            local_entropy_sum = local_entropy_sum + (entropy_chunk * weight_chunk).sum()
+
+    local_count = local_weights.sum()
+    global_count = local_count.detach().clone()
+    global_entropy_sum = local_entropy_sum.detach().clone()
+    if cp_size > 1:
+        torch.distributed.all_reduce(global_count, group=cp_group)
+        torch.distributed.all_reduce(global_entropy_sum, group=cp_group)
+    global_count = global_count.clamp(min=1.0)
+
+    entropy = global_entropy_sum / global_count
+    entropy_for_loss = local_entropy_sum / global_count
+    return entropy, entropy_for_loss
+
+
 def _packed_subseq_row_indices_offsets_and_lens(
     cu_seqlens_padded: torch.Tensor, sub_seq_lengths: list[list[int]], device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -615,6 +1044,8 @@ def vocab_parallel_entropy_packed_sequences(
     loss_mask: Optional[torch.Tensor],
     cp_group: Optional[torch.distributed.ProcessGroup],
     sub_seq_lengths: Optional[list[list[int]]] = None,
+    chunk_size: Optional[int] = 0,
+    chunk_memory_mb: int = 512,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute action-token entropy directly on TP+CP sharded packed logits.
 
@@ -623,9 +1054,8 @@ def vocab_parallel_entropy_packed_sequences(
         local term is normalized by the global action-token count. Megatron's
         schedule already applies the CP loss scale for two-output loss funcs.
     """
-    entropy_tokens = vocab_parallel_entropy(vocab_parallel_logits).squeeze(0)
-    device = entropy_tokens.device
-    dtype = entropy_tokens.dtype
+    device = vocab_parallel_logits.device
+    dtype = vocab_parallel_logits.dtype
 
     attention_mask = attention_mask.to(device=device, dtype=torch.bool)
     cu_seqlens_padded = cu_seqlens_padded.to(device=device, dtype=torch.long)
@@ -669,13 +1099,22 @@ def vocab_parallel_entropy_packed_sequences(
         cp_rank_for_token, local_indices = _packed_cp_rank_and_local_indices(
             cu_seqlens_padded, seq_indices, seq_offsets, seq_lens_padded, cp_size
         )
-        local_weights = torch.zeros_like(entropy_tokens)
+        local_weights = torch.zeros(
+            (int(vocab_parallel_logits.shape[-2]),),
+            dtype=dtype,
+            device=device,
+        )
         current_rank_mask = cp_rank_for_token == cp_rank
         local_weights[local_indices[current_rank_mask]] = packed_weights[current_rank_mask]
     else:
         local_weights = packed_weights
 
-    local_entropy_sum = (entropy_tokens * local_weights).sum()
+    local_entropy_sum = vocab_parallel_entropy_weighted_sum(
+        vocab_parallel_logits,
+        local_weights,
+        chunk_size=chunk_size,
+        chunk_memory_mb=chunk_memory_mb,
+    )
     local_count = local_weights.sum()
     global_count = local_count.detach().clone()
     global_entropy_sum = local_entropy_sum.detach().clone()
@@ -826,7 +1265,45 @@ class _VocabParallelEntropy(torch.autograd.Function):
         return softmax_logits
 
 
-def vocab_parallel_entropy(vocab_parallel_logits: torch.Tensor) -> torch.Tensor:
+def _floor_power_of_two(value: int) -> int:
+    return 1 << (value.bit_length() - 1)
+
+
+def _resolve_vocab_entropy_chunk_size(
+    vocab_parallel_logits: torch.Tensor,
+    chunk_size: Optional[int],
+    chunk_memory_mb: int,
+    peak_factor: int = 4,
+) -> Optional[int]:
+    """Resolve entropy sequence chunk size.
+
+    ``None`` preserves the legacy unchunked path. ``0`` auto-sizes from the
+    runtime vocab shard and dtype so large-vocab models avoid full [T, V] peaks.
+    Positive values are treated as explicit token chunk sizes.
+    """
+    if chunk_size is None:
+        return None
+    seq_len = int(vocab_parallel_logits.shape[-2])
+    if seq_len <= 0:
+        return None
+    if chunk_size > 0:
+        return chunk_size if chunk_size < seq_len else None
+
+    budget_bytes = int(chunk_memory_mb) * 1024 * 1024
+    bytes_per_token = int(vocab_parallel_logits.shape[-1]) * vocab_parallel_logits.element_size() * peak_factor
+    if budget_bytes <= 0 or bytes_per_token <= 0:
+        return None
+
+    auto_chunk = max(1, min(seq_len, budget_bytes // bytes_per_token))
+    auto_chunk = _floor_power_of_two(auto_chunk)
+    return auto_chunk if auto_chunk < seq_len else None
+
+
+def vocab_parallel_entropy(
+    vocab_parallel_logits: torch.Tensor,
+    chunk_size: Optional[int] = None,
+    chunk_memory_mb: int = 512,
+) -> torch.Tensor:
     """Compute entropy when the logits are sharded in tp ranks
 
     Args:
@@ -835,4 +1312,37 @@ def vocab_parallel_entropy(vocab_parallel_logits: torch.Tensor) -> torch.Tensor:
     Returns: (total_nnz,)
 
     """
-    return _VocabParallelEntropy.apply(vocab_parallel_logits)
+    resolved_chunk_size = _resolve_vocab_entropy_chunk_size(vocab_parallel_logits, chunk_size, chunk_memory_mb)
+    if resolved_chunk_size is None:
+        return _VocabParallelEntropy.apply(vocab_parallel_logits)
+
+    entropy_chunks = []
+    seq_len = int(vocab_parallel_logits.shape[-2])
+    for start in range(0, seq_len, resolved_chunk_size):
+        end = min(start + resolved_chunk_size, seq_len)
+        entropy_chunks.append(_VocabParallelEntropy.apply(vocab_parallel_logits[..., start:end, :]))
+    return torch.cat(entropy_chunks, dim=-1)
+
+
+def vocab_parallel_entropy_weighted_sum(
+    vocab_parallel_logits: torch.Tensor,
+    weights: torch.Tensor,
+    chunk_size: Optional[int] = None,
+    chunk_memory_mb: int = 512,
+) -> torch.Tensor:
+    """Compute ``sum(entropy * weights)`` while bounding vocab entropy peaks."""
+    resolved_chunk_size = _resolve_vocab_entropy_chunk_size(vocab_parallel_logits, chunk_size, chunk_memory_mb)
+    if resolved_chunk_size is None:
+        entropy_tokens = _VocabParallelEntropy.apply(vocab_parallel_logits).squeeze(0)
+        return (entropy_tokens * weights).sum()
+
+    local_entropy_sum = vocab_parallel_logits.new_zeros(())
+    seq_len = int(vocab_parallel_logits.shape[-2])
+    for start in range(0, seq_len, resolved_chunk_size):
+        end = min(start + resolved_chunk_size, seq_len)
+        weight_chunk = weights[start:end]
+        if torch.count_nonzero(weight_chunk).item() == 0:
+            continue
+        entropy_chunk = _VocabParallelEntropy.apply(vocab_parallel_logits[:, start:end, :]).squeeze(0)
+        local_entropy_sum = local_entropy_sum + (entropy_chunk * weight_chunk).sum()
+    return local_entropy_sum

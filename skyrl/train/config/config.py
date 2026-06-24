@@ -256,6 +256,28 @@ class PlacementConfig(BaseConfig):
     critic_num_gpus_per_node: int = 1
     ref_num_nodes: int = 1
     ref_num_gpus_per_node: int = 1
+    colocated_inference_memory_barrier: bool = True
+    """After rollout, put colocated inference engines to sleep and verify residual HBM before training."""
+    colocated_inference_sleep_level: int = 2
+    """vLLM sleep level used when handing the GPUs from rollout back to training."""
+    colocated_inference_residual_hbm_threshold_gb: float = 2.0
+    """Maximum allowed per-inference-process residual HBM after sleep before training continues."""
+    colocated_inference_residual_hbm_timeout_s: float = 30.0
+    """Seconds to wait for colocated inference processes to release HBM."""
+    colocated_inference_residual_hbm_poll_s: float = 1.0
+    """Polling interval for the colocated inference HBM barrier."""
+    colocated_inference_hard_evict_on_breach: bool = False
+    """When True, kill colocated inference workers if sleep leaves too much HBM before training."""
+    colocated_worker_memory_barrier: bool = True
+    """When True, check inactive colocated train workers after CPU offload."""
+    colocated_worker_residual_hbm_threshold_gb: float = 2.0
+    """Maximum allowed residual HBM per inactive colocated train worker."""
+    colocated_ref_hard_evict_on_breach: bool = True
+    """When True, restart inactive ref workers if CPU offload leaves too much HBM."""
+    colocated_worker_evict_wait_s: float = 30.0
+    """How long to wait for hard-evicted train worker PIDs to release HBM."""
+    colocated_worker_evict_poll_s: float = 1.0
+    """Polling interval while waiting for hard-evicted train worker PIDs to release HBM."""
 
 
 # ---------------------------------------------------------------------------
@@ -805,6 +827,15 @@ class TrainerConfig(BaseConfig):
     This lowers peak GPU memory at the cost of ~2x wall-clock time.
     ``None`` disables chunking (Megatron backend only; FSDP requires a positive int).
     See https://github.com/NovaSky-AI/SkyRL/pull/1610 for more details."""
+    vocab_entropy_chunk_size: Optional[int] = 0
+    """Chunk size along the sequence dimension when computing vocab entropy.
+    ``0`` auto-sizes from the vocab shard size and ``vocab_entropy_chunk_memory_mb``.
+    ``None`` preserves the legacy unchunked path."""
+    vocab_entropy_chunk_memory_mb: int = 512
+    """Approximate per-chunk temporary memory budget for auto-sized vocab entropy chunks."""
+    fused_lm_head_logprob: bool = False
+    """Megatron-only experimental path that streams LM-head logprob backward chunks.
+    This avoids materializing a full fp32 logits-gradient tensor during policy training."""
 
     def __post_init__(self):
         # ref model defaults to the policy model
@@ -822,6 +853,20 @@ class TrainerConfig(BaseConfig):
                 "logprobs_chunk_size=None (no chunking) is only supported with the Megatron backend. "
                 f"Set a positive integer for strategy={self.strategy!r}."
             )
+        if self.vocab_entropy_chunk_size is not None and (
+            not isinstance(self.vocab_entropy_chunk_size, int) or self.vocab_entropy_chunk_size < 0
+        ):
+            raise ValueError(
+                "vocab_entropy_chunk_size must be a non-negative integer or None, "
+                f"got {self.vocab_entropy_chunk_size!r}."
+            )
+        if not isinstance(self.vocab_entropy_chunk_memory_mb, int) or self.vocab_entropy_chunk_memory_mb <= 0:
+            raise ValueError(
+                "vocab_entropy_chunk_memory_mb must be a positive integer, "
+                f"got {self.vocab_entropy_chunk_memory_mb!r}."
+            )
+        if self.fused_lm_head_logprob and self.strategy != "megatron":
+            raise ValueError("fused_lm_head_logprob is only supported with the Megatron backend.")
 
 
 def validate_dict_keys_against_dataclass(datacls: Type[Any], d: dict):

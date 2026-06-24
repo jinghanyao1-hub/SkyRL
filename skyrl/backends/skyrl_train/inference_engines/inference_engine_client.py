@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import random
 import threading
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from loguru import logger
@@ -331,6 +332,89 @@ class InferenceEngineClient(InferenceEngineInterface):
 
     async def sleep(self, *args: Any, **kwargs: Any):
         return await self._run_on_all_engines("sleep", *args, **kwargs)
+
+    @staticmethod
+    def _residual_hbm_bytes(record: Dict[str, Any]) -> Optional[int]:
+        for key in ("process_used_bytes", "reserved_bytes", "allocated_bytes"):
+            value = record.get(key)
+            if value is not None:
+                return int(value)
+        return None
+
+    async def sleep_for_training(
+        self,
+        phase: str,
+        level: int = 2,
+        residual_hbm_threshold_gb: float = 2.0,
+        timeout_s: float = 30.0,
+        poll_s: float = 1.0,
+        enabled: bool = True,
+        hard_evict_on_breach: bool = False,
+    ) -> Dict[str, Any]:
+        """Sleep colocated inference engines and verify best-effort HBM release."""
+        if not enabled:
+            return {"sleep": await self.sleep(level=level)}
+
+        try:
+            await self.reset_prefix_cache()
+        except Exception as exc:
+            logger.warning(f"Failed to reset inference prefix cache before training: {exc}")
+
+        sleep_result = await self.sleep(level=level)
+        release_tasks = [
+            engine.release_cuda_memory() for engine in self.engines if hasattr(engine, "release_cuda_memory")
+        ]
+        if release_tasks:
+            await asyncio.gather(*release_tasks)
+
+        stats_engines = [engine for engine in self.engines if hasattr(engine, "cuda_memory_stats")]
+        if not stats_engines:
+            return {"sleep": sleep_result, "memory_stats": []}
+
+        threshold_bytes = int(residual_hbm_threshold_gb * (1024**3))
+        deadline = time.monotonic() + max(timeout_s, 0.0)
+        latest_records: List[Dict[str, Any]] = []
+        while True:
+            raw_records = await asyncio.gather(*[engine.cuda_memory_stats() for engine in stats_engines])
+            latest_records = [record for record in raw_records if isinstance(record, dict)]
+            measured_records = [
+                record for record in latest_records if self._residual_hbm_bytes(record) is not None
+            ]
+            offenders = [
+                record
+                for record in measured_records
+                if (residual := self._residual_hbm_bytes(record)) is not None and residual > threshold_bytes
+            ]
+            if measured_records and not offenders:
+                return {"sleep": sleep_result, "memory_stats": latest_records}
+            if time.monotonic() >= deadline:
+                if not measured_records:
+                    raise RuntimeError(
+                        "Colocated inference engines did not return usable CUDA memory stats before training "
+                        f"(phase={phase}). Raw records: {latest_records}"
+                    )
+                offender_summary = []
+                for record in sorted(offenders, key=lambda item: self._residual_hbm_bytes(item) or 0, reverse=True):
+                    residual = self._residual_hbm_bytes(record) or 0
+                    offender_summary.append(
+                        (
+                            f"host={record.get('hostname')} pid={record.get('pid')} device={record.get('device')} "
+                            f"uuid={record.get('gpu_uuid')} residual={residual / (1024**3):.2f}GiB "
+                            f"allocated={int(record.get('allocated_bytes') or 0) / (1024**3):.2f}GiB "
+                            f"reserved={int(record.get('reserved_bytes') or 0) / (1024**3):.2f}GiB"
+                        )
+                    )
+                if hard_evict_on_breach:
+                    logger.warning(
+                        "Hard eviction for colocated inference workers was requested but is not implemented by "
+                        "InferenceEngineClient; reporting residual HBM breach without eviction."
+                    )
+                raise RuntimeError(
+                    "Colocated inference engines did not release enough HBM before training "
+                    f"(phase={phase}, threshold={residual_hbm_threshold_gb:.2f}GiB, timeout={timeout_s:.1f}s). "
+                    f"Offenders: {'; '.join(offender_summary)}"
+                )
+            await asyncio.sleep(max(poll_s, 0.1))
 
     async def init_weight_update_communicator(self, init_info: "WeightSyncInitInfo"):
         """Initialize weight update communicator on all engines.

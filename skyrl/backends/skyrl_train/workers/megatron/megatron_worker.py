@@ -86,6 +86,13 @@ from skyrl.backends.skyrl_train.workers.megatron.model_bridges import (
 )
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class MegatronWeightExtractor(WeightExtractor):
     """Extracts weights from Megatron model-parallel models.
 
@@ -875,8 +882,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         all_metrics = defaultdict(list)
         all_loss_fn_outputs: List[Dict[str, Any]] = []
 
-        # Move data to GPU
-        data.to(torch.cuda.current_device())
+        # The patched profile keeps the DP shard on CPU and moves only the active
+        # microbatch in MegatronModelWrapper. Set
+        # SKYRL_CPU_RESIDENT_POLICY_MICROBATCH=0 to reproduce eager full-shard
+        # GPU residency for baseline comparisons.
+        if not _env_flag("SKYRL_CPU_RESIDENT_POLICY_MICROBATCH", True):
+            data.to(torch.cuda.current_device())
 
         # Build micro-batch dicts expected by forward_backward_mini_batch
         micro_buffer = []

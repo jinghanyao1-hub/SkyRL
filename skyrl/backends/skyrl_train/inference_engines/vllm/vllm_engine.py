@@ -1,4 +1,6 @@
 import os
+import gc
+import socket
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
@@ -13,6 +15,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import ray
+import torch
 import vllm
 from loguru import logger
 from vllm import SamplingParams
@@ -227,6 +230,80 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
     def _get_engine(self):
         """Get the underlying engine for RPC calls."""
         return self.llm.engine if hasattr(self.llm, "engine") else self.llm
+
+    def _process_used_hbm_bytes(self, device: int, gpu_uuid: Optional[str]) -> Optional[int]:
+        try:
+            import pynvml
+
+            pynvml.nvmlInit()
+            if gpu_uuid:
+                try:
+                    handle = pynvml.nvmlDeviceGetHandleByUUID(gpu_uuid.encode("ascii"))
+                except TypeError:
+                    handle = pynvml.nvmlDeviceGetHandleByUUID(gpu_uuid)
+            else:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(device)
+
+            processes = []
+            for getter_name in ("nvmlDeviceGetComputeRunningProcesses", "nvmlDeviceGetGraphicsRunningProcesses"):
+                getter = getattr(pynvml, getter_name, None)
+                if getter is None:
+                    continue
+                try:
+                    processes.extend(getter(handle))
+                except Exception:
+                    pass
+            current_pid = os.getpid()
+            for proc in processes:
+                if int(proc.pid) == current_pid:
+                    return int(getattr(proc, "usedGpuMemory", 0) or 0)
+            return 0
+        except Exception:
+            return None
+
+    async def cuda_memory_stats(self) -> Dict[str, Any]:
+        """Return best-effort CUDA memory stats for this inference-engine process."""
+        record: Dict[str, Any] = {
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+            "cuda_available": torch.cuda.is_available(),
+        }
+        if not torch.cuda.is_available():
+            return record
+
+        device = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(device)
+        raw_gpu_uuid = getattr(props, "uuid", None)
+        gpu_uuid = raw_gpu_uuid if isinstance(raw_gpu_uuid, str) else None
+        torch.cuda.synchronize(device)
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        record.update(
+            {
+                "device": device,
+                "gpu_name": getattr(props, "name", None),
+                "gpu_uuid": (
+                    gpu_uuid if gpu_uuid is not None else str(raw_gpu_uuid) if raw_gpu_uuid is not None else None
+                ),
+                "allocated_bytes": torch.cuda.memory_allocated(device),
+                "reserved_bytes": torch.cuda.memory_reserved(device),
+                "free_bytes": free_bytes,
+                "total_bytes": total_bytes,
+                "process_used_bytes": self._process_used_hbm_bytes(device, gpu_uuid),
+            }
+        )
+        return record
+
+    async def release_cuda_memory(self) -> Dict[str, Any]:
+        """Run allocator cleanup after vLLM sleep and return post-cleanup stats."""
+        gc.collect()
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+            torch.cuda.synchronize(device)
+        return await self.cuda_memory_stats()
 
     @staticmethod
     def _get_unfinished_request_ids(output_processor) -> list:

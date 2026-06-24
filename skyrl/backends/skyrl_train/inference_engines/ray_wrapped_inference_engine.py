@@ -63,6 +63,12 @@ class RayWrappedInferenceEngine(InferenceEngineInterface):
     async def sleep(self, *args: Any, **kwargs: Any):
         return await self.inference_engine_actor.sleep.remote(*args, **kwargs)
 
+    async def release_cuda_memory(self):
+        return await self.inference_engine_actor.release_cuda_memory.remote()
+
+    async def cuda_memory_stats(self):
+        return await self.inference_engine_actor.cuda_memory_stats.remote()
+
     async def init_weight_update_communicator(self, init_info: "WeightSyncInitInfo"):
         return await self.inference_engine_actor.init_weight_update_communicator.remote(init_info)
 

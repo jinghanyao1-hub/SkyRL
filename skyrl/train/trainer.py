@@ -232,6 +232,42 @@ class RayPPOTrainer:
             )
         return eval_metrics
 
+    async def sleep_inference_for_training(self, phase: str) -> None:
+        """Sleep colocated inference engines and verify HBM is ready for training."""
+        if not self.colocate_all:
+            return
+
+        placement_cfg = self.cfg.trainer.placement
+        if placement_cfg.colocated_inference_memory_barrier and hasattr(
+            self.inference_engine_client, "sleep_for_training"
+        ):
+            await self.inference_engine_client.sleep_for_training(
+                phase=phase,
+                level=placement_cfg.colocated_inference_sleep_level,
+                residual_hbm_threshold_gb=placement_cfg.colocated_inference_residual_hbm_threshold_gb,
+                timeout_s=placement_cfg.colocated_inference_residual_hbm_timeout_s,
+                poll_s=placement_cfg.colocated_inference_residual_hbm_poll_s,
+                enabled=True,
+                hard_evict_on_breach=placement_cfg.colocated_inference_hard_evict_on_breach,
+            )
+        else:
+            await self.inference_engine_client.sleep(level=placement_cfg.colocated_inference_sleep_level)
+
+    async def ensure_inference_for_weight_sync(self) -> None:
+        """Restart hard-evicted colocated inference engines before weight-sync RPC setup."""
+        if not self.colocate_all:
+            return
+        if hasattr(self.inference_engine_client, "ensure_alive_for_sampling"):
+            await self.inference_engine_client.ensure_alive_for_sampling()
+
+    async def sleep_inference_before_weight_sync(self, phase: str) -> None:
+        """Put inference engines in low-memory sleep state before policy weights are loaded for sync."""
+        if not self.colocate_all:
+            return
+        placement_cfg = self.cfg.trainer.placement
+        logger.info(f"Sleeping inference workers before weight sync phase={phase}")
+        await self.inference_engine_client.sleep(level=placement_cfg.colocated_inference_sleep_level)
+
     async def train(self):
         """
         Main training loop for PPO
@@ -241,7 +277,9 @@ class RayPPOTrainer:
 
         # Initialize weight sync state between policy model and inference engines.
         with Timer("init_weight_sync_state"):
+            await self.ensure_inference_for_weight_sync()
             self.init_weight_sync_state()
+            await self.sleep_inference_before_weight_sync("post_init_weight_sync_state")
 
         # Load checkpoint state if resumption is enabled.
         if self.resume_mode != ResumeMode.NONE:
@@ -329,7 +367,7 @@ class RayPPOTrainer:
 
                     if self.colocate_all:
                         # if we are not continuing sampling, we sleep the inference engine
-                        await self.inference_engine_client.sleep()
+                        await self.sleep_inference_for_training("post_generate")
 
                     # 1.2 postprocess rewards (and merge step-wise turns if enabled)
                     with Timer("postprocess_generator_output", self.all_timings):
@@ -478,7 +516,7 @@ class RayPPOTrainer:
 
         pbar.close()
         if self.colocate_all:
-            await self.inference_engine_client.sleep()
+            await self.sleep_inference_for_training("train_end")
 
         # Decrement global step by 1 to stop at the last global step
         # We use the global step value in callbacks when training finishes,
@@ -1346,7 +1384,6 @@ class RayPPOTrainer:
 
         return data
 
-    @torch.no_grad()
     def _normalize_advantages(
         self,
         data: TrainingInputBatch,

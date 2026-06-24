@@ -1,3 +1,4 @@
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
@@ -7,6 +8,7 @@ import torch
 import torch.nn as nn
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.utils import get_attr_wrapped_model
 from omegaconf import OmegaConf
 
 from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
@@ -18,8 +20,10 @@ from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
     remove_left_padding,
 )
 from skyrl.backends.skyrl_train.distributed.megatron.model_utils import (
+    from_fused_lm_head_to_logprobs_packed_sequences,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
+    vocab_parallel_entropy_from_fused_lm_head_packed_sequences,
     vocab_parallel_entropy,
     vocab_parallel_entropy_packed_sequences,
 )
@@ -76,6 +80,68 @@ def _build_packed_targets(
     return targets.unsqueeze(0)
 
 
+def _copy_tensor_dict_to_device(batch: Dict[str, Any], device: int) -> Dict[str, Any]:
+    """Copy tensor values to device without mutating the CPU microbatch cache."""
+    return {
+        key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+        for key, value in batch.items()
+    }
+
+
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    while hasattr(model, "module"):
+        model = model.module
+    return model
+
+
+def _iter_module_chain(model: nn.Module):
+    seen = set()
+    stack = [model]
+    while stack:
+        module = stack.pop()
+        if id(module) in seen:
+            continue
+        seen.add(id(module))
+        yield module
+
+        child = getattr(module, "module", None)
+        if isinstance(child, nn.Module):
+            stack.append(child)
+        elif isinstance(child, (list, tuple)):
+            stack.extend(item for item in child if isinstance(item, nn.Module))
+
+        stack.extend(module.children())
+
+
+def _get_wrapped_attr(model: nn.Module, attr: str, allow_none: bool = True) -> Any:
+    try:
+        return get_attr_wrapped_model(model, attr, allow_none=allow_none)
+    except Exception:
+        if allow_none:
+            return None
+        raise
+
+
+@contextmanager
+def _temporary_post_process(model: nn.Module, post_process: bool):
+    targets = []
+    for module in _iter_module_chain(model):
+        if hasattr(module, "post_process"):
+            targets.append((module, module.post_process))
+
+    if not targets:
+        yield
+        return
+
+    for module, _old_post_process in targets:
+        module.post_process = post_process
+    try:
+        yield
+    finally:
+        for module, old_post_process in targets:
+            module.post_process = old_post_process
+
+
 class MegatronModelWrapper:
     def __init__(
         self,
@@ -111,6 +177,93 @@ class MegatronModelWrapper:
         # scaling, and any explicit loss_scale configuration).
         if actor_optimizer is not None:
             config.grad_scale_func = actor_optimizer.scale_loss
+        self._fused_lm_head_status_logged = False
+        print(
+            f"[skyrl] MegatronModelWrapper init fused_lm_head_logprob={self.cfg.fused_lm_head_logprob}",
+            flush=True,
+        )
+
+    def _fused_lm_head_fallback_reason(
+        self,
+        model: nn.Module,
+        loss_name: str,
+        loss_config: Any,
+        forward_only: bool,
+    ) -> Optional[str]:
+        if not self.cfg.fused_lm_head_logprob:
+            return "disabled"
+        if forward_only:
+            return "forward_only"
+        if loss_name == "cross_entropy":
+            return "cross_entropy_loss"
+        if not self.remove_microbatch_padding:
+            return "requires_remove_microbatch_padding"
+        if loss_config.use_entropy_loss:
+            return "entropy_loss_requires_logits"
+        if self.cfg.logprobs_chunk_size is None:
+            return "requires_logprobs_chunk_size"
+        if not mpu.is_pipeline_last_stage(ignore_virtual=True):
+            return None
+        if mpu.get_tensor_model_parallel_world_size() != 1:
+            return "tp_world_size_not_1"
+
+        if _get_wrapped_attr(model, "post_process", allow_none=True) is None:
+            return "missing_post_process"
+        model_config = get_model_config(model)
+        if getattr(model_config, "use_mup", False):
+            return "mup_not_supported"
+
+        try:
+            lm_head_weight = self._get_lm_head_weight(model)
+        except RuntimeError as exc:
+            return f"missing_lm_head_weight:{exc}"
+        if lm_head_weight is None or lm_head_weight.dim() != 2:
+            return "invalid_lm_head_weight"
+
+        output_layer = _get_wrapped_attr(model, "output_layer", allow_none=True)
+        if output_layer is not None and getattr(output_layer, "bias", None) is not None:
+            return "output_layer_bias_not_supported"
+        return None
+
+    def _get_lm_head_weight(self, model: nn.Module) -> torch.Tensor:
+        model_config = get_model_config(model)
+        hidden_size = getattr(model_config, "hidden_size", None)
+
+        share_embeddings = bool(
+            _get_wrapped_attr(model, "share_embeddings_and_output_weights", allow_none=True)
+        )
+        if share_embeddings:
+            shared_weight_getter = _get_wrapped_attr(
+                model, "shared_embedding_or_output_weight", allow_none=True
+            )
+            if shared_weight_getter is not None:
+                shared_weight = shared_weight_getter()
+                if shared_weight is not None:
+                    return shared_weight
+
+        output_layer = _get_wrapped_attr(model, "output_layer", allow_none=True)
+        if output_layer is None or getattr(output_layer, "weight", None) is None:
+            for name, param in model.named_parameters():
+                if param.dim() != 2 or "output_layer" not in name:
+                    continue
+                if hidden_size is not None and int(param.shape[-1]) != int(hidden_size):
+                    continue
+                print(
+                    f"[skyrl] fused_lm_head_logprob using named parameter {name} "
+                    f"shape={tuple(param.shape)}",
+                    flush=True,
+                )
+                return param
+            candidates = [
+                f"{name}:{tuple(param.shape)}"
+                for name, param in model.named_parameters()
+                if param.dim() == 2 and ("output" in name or "embedding" in name)
+            ][:12]
+            raise RuntimeError(
+                "Cannot locate Megatron LM-head output weight for fused logprob path. "
+                f"candidate_2d_params={candidates}"
+            )
+        return output_layer.weight
 
     def train(self):
         [module.train() for module in self.actor_module]
@@ -182,7 +335,7 @@ class MegatronModelWrapper:
             return torch.tensor(0.0, device=token_logprobs.device), {"log_probs": token_logprobs}
 
         def forward_step(batch_iter, model):
-            batch = next(batch_iter)
+            batch = _copy_tensor_dict_to_device(next(batch_iter), torch.cuda.current_device())
 
             rollout_expert_indices = batch.pop("rollout_expert_indices", None)
             if rollout_expert_indices is not None:
@@ -334,12 +487,45 @@ class MegatronModelWrapper:
             dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
             tp_grp = mpu.get_tensor_model_parallel_group()
             tp_rank = mpu.get_tensor_model_parallel_rank()
+            fused_lm_head_logprob = bool(data.get("fused_lm_head_logprob", False))
+            fused_hidden_states = None
+            fused_lm_head_weight = data.get("fused_lm_head_weight")
 
-            # temperature normalization
-            if temperature != 1.0:
+            if fused_lm_head_logprob:
+                # Megatron returns hidden states as [sequence, batch, hidden]
+                # when GPTModel.post_process is disabled.
+                mtp_num_layers = int(data.get("fused_lm_head_mtp_num_layers") or 0)
+                if mtp_num_layers > 0:
+                    logits = torch.chunk(logits, 1 + mtp_num_layers, dim=0)[0]
+                fused_hidden_states = logits.transpose(0, 1).contiguous()
+                if fused_lm_head_weight is not None and fused_hidden_states.shape[-1] != fused_lm_head_weight.shape[-1]:
+                    raise RuntimeError(
+                        "Fused LM-head path expected decoder hidden states with last dim "
+                        f"{fused_lm_head_weight.shape[-1]}, got {tuple(fused_hidden_states.shape)}. "
+                        "Megatron post_process was not disabled for this forward."
+                    )
+            elif temperature != 1.0:
                 logits.div_(temperature)
 
-            if packed_seq_params is not None and packed_targets is not None:
+            if fused_lm_head_logprob:
+                if packed_seq_params is None or packed_targets is None or fused_lm_head_weight is None:
+                    raise RuntimeError("Fused LM-head logprob path requires packed targets and LM-head weight.")
+                token_logprobs = from_fused_lm_head_to_logprobs_packed_sequences(
+                    fused_hidden_states,
+                    fused_lm_head_weight,
+                    packed_targets,
+                    packed_seq_params.cu_seqlens_q_padded,
+                    sequences.shape[1],
+                    vocab_start_index=tp_rank * fused_lm_head_weight.shape[0],
+                    vocab_end_index=(tp_rank + 1) * fused_lm_head_weight.shape[0],
+                    group=tp_grp,
+                    chunk_size=self.cfg.logprobs_chunk_size,
+                    temperature=temperature,
+                    cp_group=mpu.get_context_parallel_group(),
+                    attention_mask=data["attention_mask"],
+                    sub_seq_lengths=data.get("sub_seq_lengths_list"),
+                )
+            elif packed_seq_params is not None and packed_targets is not None:
                 token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
                     logits,
                     packed_targets,
@@ -427,7 +613,22 @@ class MegatronModelWrapper:
 
             # RL path: add optional KL/entropy terms
             with torch.set_grad_enabled(loss_config.use_entropy_loss):
-                if packed_seq_params is not None and packed_targets is not None:
+                if fused_lm_head_logprob:
+                    entropy, entropy_for_loss = vocab_parallel_entropy_from_fused_lm_head_packed_sequences(
+                        fused_hidden_states,
+                        fused_lm_head_weight,
+                        packed_seq_params.cu_seqlens_q_padded,
+                        sequences.shape[1],
+                        num_actions,
+                        data["attention_mask"],
+                        loss_mask,
+                        mpu.get_context_parallel_group(),
+                        sub_seq_lengths=data.get("sub_seq_lengths_list"),
+                        chunk_size=self.cfg.vocab_entropy_chunk_size,
+                        chunk_memory_mb=self.cfg.vocab_entropy_chunk_memory_mb,
+                        temperature=temperature,
+                    )
+                elif packed_seq_params is not None and packed_targets is not None:
                     entropy, entropy_for_loss = vocab_parallel_entropy_packed_sequences(
                         logits,
                         packed_seq_params.cu_seqlens_q_padded,
@@ -437,17 +638,23 @@ class MegatronModelWrapper:
                         loss_mask,
                         mpu.get_context_parallel_group(),
                         sub_seq_lengths=data.get("sub_seq_lengths_list"),
+                        chunk_size=self.cfg.vocab_entropy_chunk_size,
+                        chunk_memory_mb=self.cfg.vocab_entropy_chunk_memory_mb,
                     )
                 else:
                     action_logits = logits[:, -num_actions - 1 : -1, :]
-                    entropy_BS = vocab_parallel_entropy(action_logits)
+                    entropy_BS = vocab_parallel_entropy(
+                        action_logits,
+                        chunk_size=self.cfg.vocab_entropy_chunk_size,
+                        chunk_memory_mb=self.cfg.vocab_entropy_chunk_memory_mb,
+                    )
                     entropy = masked_mean(entropy_BS, loss_mask)
                     entropy_for_loss = entropy
 
             if loss_config.use_entropy_loss:
                 entropy_loss_term = entropy_for_loss * loss_config.entropy_loss_coef
             else:
-                entropy_loss_term = torch.tensor(0.0, device=logits.device)
+                entropy_loss_term = torch.tensor(0.0, device=action_log_probs.device)
 
             if loss_config.use_kl_loss:
                 kl_loss = compute_approx_kl(
@@ -458,7 +665,7 @@ class MegatronModelWrapper:
                 )
                 kl_loss = masked_mean(kl_loss, loss_mask, dim=-1).mean()
             else:
-                kl_loss = torch.tensor(0.0, device=logits.device)
+                kl_loss = torch.tensor(0.0, device=action_log_probs.device)
             kl_loss_term = kl_loss * loss_config.kl_loss_coef
 
             # Policy losses are pre-scaled to achieve the correct loss_reduction
@@ -526,7 +733,7 @@ class MegatronModelWrapper:
             # (can be left, or right) as it uses attention_mask to locate real tokens. Same thing
             # for recover_left_padding and setup_per_microbatch_replay_forward. Especially relevant
             # after this PR https://github.com/NovaSky-AI/SkyRL/pull/1285.
-            batch = next(batch_iter)
+            batch = _copy_tensor_dict_to_device(next(batch_iter), torch.cuda.current_device())
 
             rollout_expert_indices = batch.pop("rollout_expert_indices", None)
             if rollout_expert_indices is not None:
@@ -551,6 +758,31 @@ class MegatronModelWrapper:
             sub_seq_lengths_field = batch.get("sub_seq_lengths")
             sub_seq_lengths = [t.tolist() for t in sub_seq_lengths_field] if sub_seq_lengths_field is not None else None
             batch["sub_seq_lengths_list"] = sub_seq_lengths
+            fused_fallback_reason = self._fused_lm_head_fallback_reason(
+                model,
+                resolved_loss_name,
+                loss_config,
+                forward_only,
+            )
+            use_fused_lm_head_logprob = (
+                self.cfg.fused_lm_head_logprob
+                and mpu.is_pipeline_last_stage(ignore_virtual=True)
+                and fused_fallback_reason is None
+            )
+            if (
+                self.cfg.fused_lm_head_logprob
+                and mpu.is_pipeline_last_stage(ignore_virtual=True)
+                and not self._fused_lm_head_status_logged
+            ):
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                status = "enabled" if use_fused_lm_head_logprob else f"fallback:{fused_fallback_reason}"
+                print(f"[skyrl] fused_lm_head_logprob={status} rank={rank}", flush=True)
+                self._fused_lm_head_status_logged = True
+                if fused_fallback_reason is not None:
+                    raise RuntimeError(
+                        "trainer.fused_lm_head_logprob=true but fused path is unavailable: "
+                        f"{fused_fallback_reason}"
+                    )
 
             if self.remove_microbatch_padding:
                 new_sequences, packed_seq_params = preprocess_packed_seqs(
@@ -574,12 +806,22 @@ class MegatronModelWrapper:
                 )
                 packed_seq_params = None
 
-            outputs = model(
-                new_sequences,
-                new_position_ids,
-                new_attention_mask,
-                packed_seq_params=packed_seq_params,
+            if use_fused_lm_head_logprob:
+                batch["fused_lm_head_logprob"] = True
+                batch["fused_lm_head_weight"] = self._get_lm_head_weight(model)
+                model_config = get_model_config(_unwrap_model(model))
+                batch["fused_lm_head_mtp_num_layers"] = getattr(model_config, "mtp_num_layers", None)
+
+            post_process_context = (
+                _temporary_post_process(model, post_process=False) if use_fused_lm_head_logprob else nullcontext()
             )
+            with post_process_context:
+                outputs = model(
+                    new_sequences,
+                    new_position_ids,
+                    new_attention_mask,
+                    packed_seq_params=packed_seq_params,
+                )
 
             if not self.remove_microbatch_padding:
                 outputs = recover_left_padding(

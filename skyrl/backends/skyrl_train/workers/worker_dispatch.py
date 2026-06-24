@@ -8,10 +8,14 @@ Automatically handles GPU placement:
 The trainer interacts with the worker dispatch if all models are always on GPU.
 """
 
+import os
+import socket
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import ray
+from loguru import logger
 from ray import ObjectRef
 
 from skyrl.backends.skyrl_train.distributed.dispatch import (
@@ -26,6 +30,13 @@ from skyrl.backends.skyrl_train.training_batch import (
 )
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
 from skyrl.train.config import SkyRLTrainConfig
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -68,6 +79,14 @@ class WorkerDispatch:
 
         # GPU state tracking (only matters when colocated)
         self._gpu_state: Dict[str, GPUState] = {name: GPUState() for name in self._actor_groups.keys()}
+
+    @staticmethod
+    def _log_dispatch_timing(operation: str, start: float, **fields: Any) -> None:
+        """Emit compact timing logs for colocated offload/onload analysis."""
+        elapsed = time.monotonic() - start
+        extras = " ".join(f"{key}={value}" for key, value in fields.items())
+        suffix = f" {extras}" if extras else ""
+        logger.info(f"DispatchTiming operation={operation} elapsed_s={elapsed:.3f}{suffix}")
 
     def register_actor_group(self, model: str, actor_group: PPORayActorGroup) -> None:
         self._actor_groups[model] = actor_group
@@ -134,6 +153,177 @@ class WorkerDispatch:
             return [m for m in ["policy", "ref"] if m in self._actor_groups]
         return [model]
 
+    @staticmethod
+    def _worker_residual_hbm_bytes(stats: Dict[str, Any]) -> int:
+        """Best-effort residual HBM for a worker process after offload."""
+        for key in ("nvml_used_bytes", "reserved_bytes", "allocated_bytes"):
+            value = stats.get(key)
+            if value is not None:
+                return int(value)
+        return 0
+
+    def _process_cuda_memory_by_uuid(self, pid: int, gpu_uuid: str) -> Optional[int]:
+        """Return process CUDA memory from local NVML, or None when unavailable."""
+        try:
+            import pynvml
+
+            pynvml.nvmlInit()
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByUUID(gpu_uuid.encode("ascii"))
+            except TypeError:
+                handle = pynvml.nvmlDeviceGetHandleByUUID(gpu_uuid)
+
+            processes = []
+            for getter_name in ("nvmlDeviceGetComputeRunningProcesses", "nvmlDeviceGetGraphicsRunningProcesses"):
+                getter = getattr(pynvml, getter_name, None)
+                if getter is None:
+                    continue
+                try:
+                    processes.extend(getter(handle))
+                except Exception:
+                    pass
+            for proc in processes:
+                if int(proc.pid) == int(pid):
+                    return int(getattr(proc, "usedGpuMemory", 0) or 0)
+            return 0
+        except Exception:
+            return None
+
+    def _wait_for_worker_pids_to_release_hbm(self, stats: List[Dict[str, Any]]) -> None:
+        """Wait for hard-evicted local worker PIDs to disappear from NVML."""
+        wait_start = time.monotonic()
+        placement = self.cfg.trainer.placement
+        timeout_s = float(getattr(placement, "colocated_worker_evict_wait_s", 30.0))
+        poll_s = float(getattr(placement, "colocated_worker_evict_poll_s", 1.0))
+        if timeout_s <= 0:
+            self._log_dispatch_timing("wait_worker_hbm_release_skipped", wait_start, reason="timeout_disabled")
+            return
+
+        local_host = socket.gethostname()
+        pid_records = []
+        for record in stats:
+            pid = record.get("pid")
+            gpu_uuid = record.get("gpu_uuid")
+            hostname = record.get("hostname")
+            if pid is None or not gpu_uuid or hostname != local_host:
+                continue
+            pid_records.append((int(pid), str(gpu_uuid)))
+        if not pid_records:
+            self._log_dispatch_timing("wait_worker_hbm_release_skipped", wait_start, reason="no_local_pids")
+            return
+
+        deadline = time.monotonic() + timeout_s
+        while True:
+            remaining = []
+            for pid, gpu_uuid in pid_records:
+                used = self._process_cuda_memory_by_uuid(pid, gpu_uuid)
+                if used is None:
+                    self._log_dispatch_timing("wait_worker_hbm_release_unavailable", wait_start, pid=pid)
+                    return
+                if used > 0:
+                    remaining.append((pid, used))
+            if not remaining:
+                self._log_dispatch_timing("wait_worker_hbm_release", wait_start, pid_count=len(pid_records))
+                return
+            if time.monotonic() >= deadline:
+                remaining_str = ", ".join(f"pid={pid} used={used / (1024**3):.2f}GiB" for pid, used in remaining)
+                logger.warning(f"Timed out waiting for hard-evicted worker PIDs to release HBM: {remaining_str}")
+                self._log_dispatch_timing(
+                    "wait_worker_hbm_release_timeout",
+                    wait_start,
+                    pid_count=len(pid_records),
+                    remaining=len(remaining),
+                )
+                return
+            time.sleep(poll_s)
+
+    def _enforce_inactive_worker_memory_barrier(self, model: str, stats: List[Dict[str, Any]]) -> None:
+        """Fail soft-offload residuals into a hard ref eviction when it is safe."""
+        placement = self.cfg.trainer.placement
+        if not getattr(placement, "colocated_worker_memory_barrier", True):
+            return
+        if not stats:
+            return
+
+        threshold = float(getattr(placement, "colocated_worker_residual_hbm_threshold_gb", 2.0)) * (1024**3)
+        max_record = max(stats, key=self._worker_residual_hbm_bytes)
+        max_residual = self._worker_residual_hbm_bytes(max_record)
+        logger.info(
+            f"Inactive colocated worker barrier model={model} max_residual={max_residual / (1024**3):.2f} GiB "
+            f"threshold={threshold / (1024**3):.2f} GiB"
+        )
+        if max_residual <= threshold:
+            return
+
+        if model != "ref" or not getattr(placement, "colocated_ref_hard_evict_on_breach", True):
+            logger.warning(
+                f"Inactive colocated worker model={model} still holds {max_residual / (1024**3):.2f} GiB HBM "
+                "after CPU offload."
+            )
+            return
+
+        group = self._actor_groups[model]
+        if not hasattr(group, "shutdown") or not hasattr(group, "can_restore_init_model"):
+            logger.warning(f"Cannot hard-evict inactive colocated {model} worker: actor group has no restart hooks.")
+            return
+        if not group.can_restore_init_model():
+            logger.warning(
+                f"Cannot hard-evict inactive colocated {model} worker because its last init_model path is unavailable."
+            )
+            return
+
+        logger.warning(
+            f"Hard-evicting inactive colocated {model} workers after CPU offload left "
+            f"{max_residual / (1024**3):.2f} GiB HBM."
+        )
+        shutdown_start = time.monotonic()
+        group.shutdown()
+        self._log_dispatch_timing("inactive_worker_shutdown", shutdown_start, model=model)
+        self._gpu_state[model] = GPUState()
+        wait_start = time.monotonic()
+        self._wait_for_worker_pids_to_release_hbm(stats)
+        self._log_dispatch_timing("inactive_worker_post_shutdown_wait_total", wait_start, model=model)
+
+    def _offload_inactive_model(self, model: str) -> None:
+        """Offload an inactive colocated model and enforce residual-memory policy."""
+        total_start = time.monotonic()
+        group = self._actor_groups[model]
+        if getattr(group, "is_shutdown", False):
+            self._gpu_state[model] = GPUState()
+            self._log_dispatch_timing("offload_inactive_model_skipped", total_start, model=model, reason="shutdown")
+            return
+        offload_start = time.monotonic()
+        group.offload_to_cpu()
+        self._log_dispatch_timing("offload_inactive_model_to_cpu", offload_start, model=model)
+        stats: List[Dict[str, Any]] = []
+        if _env_flag("SKYRL_OFFLOAD_EMPTY_CACHE_AFTER_CPU_OFFLOAD", True):
+            empty_start = time.monotonic()
+            stats = self.empty_cache(model)
+            self._log_dispatch_timing("offload_inactive_model_empty_cache_total", empty_start, model=model)
+        else:
+            self._log_dispatch_timing(
+                "offload_inactive_model_empty_cache_skipped",
+                time.monotonic(),
+                model=model,
+            )
+        self._gpu_state[model] = GPUState()
+        barrier_start = time.monotonic()
+        self._enforce_inactive_worker_memory_barrier(model, stats)
+        self._log_dispatch_timing("offload_inactive_model_barrier", barrier_start, model=model)
+        self._log_dispatch_timing("offload_inactive_model_total", total_start, model=model)
+
+    def _ensure_actor_group_ready(self, model: str) -> None:
+        """Restart a hard-evicted actor group before the model is used again."""
+        group = self._actor_groups[model]
+        if not getattr(group, "is_shutdown", False):
+            return
+        if not hasattr(group, "restart_actors") or not hasattr(group, "restore_init_model"):
+            raise RuntimeError(f"Actor group for {model} was evicted and cannot be restarted.")
+        logger.info(f"Restarting hard-evicted colocated {model} actors.")
+        group.restart_actors()
+        group.restore_init_model()
+        self._gpu_state[model] = GPUState(model_on_gpu=True, optimizer_on_gpu=(model != "ref"))
+
     def _ensure_on_gpu(self, model: str, need_optimizer: bool = True, need_model: bool = True) -> None:
         """Ensure model is on GPU, offloading others in same colocation group if needed."""
         if not self._should_manage_offload(model):
@@ -142,6 +332,8 @@ class WorkerDispatch:
         if model not in self._actor_groups:
             return
 
+        self._ensure_actor_group_ready(model)
+
         group = self._get_colocation_group(model)
 
         # Offload others in the same colocation group
@@ -149,17 +341,24 @@ class WorkerDispatch:
             if other != model and other in self._actor_groups:
                 state = self._gpu_state[other]
                 if state.model_on_gpu or state.optimizer_on_gpu:
-                    self._actor_groups[other].offload_to_cpu()
-                    self._gpu_state[other] = GPUState()
+                    self._offload_inactive_model(other)
 
         # Backload requested model
         state = self._gpu_state[model]
         needs_backload = (need_model and not state.model_on_gpu) or (need_optimizer and not state.optimizer_on_gpu)
 
         if needs_backload:
+            backload_start = time.monotonic()
             self._actor_groups[model].backload_to_gpu(
                 backload_optimizer=need_optimizer,
                 backload_model=need_model,
+            )
+            self._log_dispatch_timing(
+                "backload_to_gpu",
+                backload_start,
+                model=model,
+                need_model=need_model,
+                need_optimizer=need_optimizer,
             )
             if need_model:
                 self._gpu_state[model].model_on_gpu = True
@@ -174,10 +373,15 @@ class WorkerDispatch:
         if model not in self._actor_groups:
             return
 
+        if getattr(self._actor_groups[model], "is_shutdown", False):
+            self._gpu_state[model] = GPUState()
+            return
+
         self._actor_groups[model].offload_to_cpu(
             offload_optimizer=offload_optimizer,
             offload_model=offload_model,
         )
+        self.empty_cache(model)
 
         if offload_model:
             self._gpu_state[model].model_on_gpu = False
@@ -464,6 +668,14 @@ class WorkerDispatch:
 
     def init_model(self, model: str, model_path: str, num_training_steps: Optional[int] = None) -> None:
         """Initialize model from path. Offloads others in colocation group first."""
+        if model not in self._actor_groups:
+            return
+        actor_group = self._actor_groups[model]
+        if getattr(actor_group, "is_shutdown", False):
+            if not hasattr(actor_group, "restart_actors"):
+                raise RuntimeError(f"Actor group for {model} was evicted and cannot be restarted.")
+            actor_group.restart_actors()
+
         # Offload others in colocation group before init
         if self._should_manage_offload(model):
             group = self._get_colocation_group(model)
@@ -471,8 +683,7 @@ class WorkerDispatch:
                 if other != model and other in self._actor_groups:
                     state = self._gpu_state[other]
                     if state.model_on_gpu or state.optimizer_on_gpu:
-                        self._actor_groups[other].offload_to_cpu()
-                        self._gpu_state[other] = GPUState()
+                        self._offload_inactive_model(other)
 
         kwargs = {"model_path": model_path}
         if num_training_steps is not None:
@@ -491,15 +702,37 @@ class WorkerDispatch:
         """
         self._inference_engine_client = inference_engine_client
 
-    def empty_cache(self, model: Optional[str] = None) -> None:
+    def empty_cache(self, model: Optional[str] = None) -> List[Dict[str, Any]]:
         """Empty GPU cache for model(s)."""
+        empty_start = time.monotonic()
         if model is not None:
-            ray.get(self._actor_groups[model].async_run_ray_method("pass_through", "empty_cache"))
-        else:
-            refs = []
-            for group in self._actor_groups.values():
+            if getattr(self._actor_groups[model], "is_shutdown", False):
+                self._log_dispatch_timing("empty_cache_skipped", empty_start, model=model, reason="shutdown")
+                return []
+            stats = ray.get(self._actor_groups[model].async_run_ray_method("pass_through", "empty_cache"))
+            max_residual = max((self._worker_residual_hbm_bytes(record) for record in stats), default=0)
+            self._log_dispatch_timing(
+                "empty_cache",
+                empty_start,
+                model=model,
+                stats_count=len(stats),
+                max_residual_gib=f"{max_residual / (1024**3):.2f}",
+            )
+            return stats
+
+        refs = []
+        for group in self._actor_groups.values():
+            if not getattr(group, "is_shutdown", False):
                 refs.extend(group.async_run_ray_method("pass_through", "empty_cache"))
-            ray.get(refs)
+        stats = ray.get(refs)
+        max_residual = max((self._worker_residual_hbm_bytes(record) for record in stats), default=0)
+        self._log_dispatch_timing(
+            "empty_cache_all",
+            empty_start,
+            stats_count=len(stats),
+            max_residual_gib=f"{max_residual / (1024**3):.2f}",
+        )
+        return stats
 
     def get_node_ids(self) -> List[str]:
         """Get unique node IDs from all actor groups."""
@@ -572,6 +805,19 @@ class WorkerDispatch:
                 "Cannot save_weights_for_sampler: no inference_engine_client configured. "
                 "Pass inference_engine_client to WorkerDispatch constructor or call set_inference_engine_client()."
             )
+
+        inference_was_evicted = bool(getattr(self._inference_engine_client, "servers_evicted", False))
+        if inference_was_evicted and self.colocate_all:
+            policy_state = self._gpu_state.get("policy")
+            if policy_state is not None and (policy_state.model_on_gpu or policy_state.optimizer_on_gpu):
+                self._offload("policy", offload_optimizer=True, offload_model=True)
+            if hasattr(self._inference_engine_client, "ensure_alive_for_sampling"):
+                await self._inference_engine_client.ensure_alive_for_sampling()
+                await self._inference_engine_client.sleep(
+                    level=self.cfg.trainer.placement.colocated_inference_sleep_level
+                )
+        elif hasattr(self._inference_engine_client, "ensure_alive_for_sampling"):
+            await self._inference_engine_client.ensure_alive_for_sampling()
 
         # Sync weights to inference engine
         self._prepare_for_weight_sync()
