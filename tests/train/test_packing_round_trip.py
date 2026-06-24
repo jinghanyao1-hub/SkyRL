@@ -20,6 +20,7 @@ Run with:
 
 from __future__ import annotations
 
+import math
 import sys
 from dataclasses import dataclass
 from types import ModuleType
@@ -104,6 +105,11 @@ def _mock_mpu(tp_size: int = 1, cp_size: int = 1, cp_rank: int = 0):
     return mock
 
 
+def _get_align_size(tp_size: int, cp_size: int) -> int:
+    layout_align = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+    return math.lcm(layout_align, 16 * cp_size)
+
+
 def _build_collator_layout(
     sub_seq_token_lists: list[list[list[int]]],
     *,
@@ -156,6 +162,7 @@ class TestPreprocessPackedRows:
         )
 
         tp_size = 4
+        align_size = _get_align_size(tp_size, cp_size=1)
         # Distinct unique tokens per sub-seq so we can spot off-by-one bugs.
         row_0_sub_0 = [101, 102, 103, 104, 105, 106, 107]  # len 7
         row_0_sub_1 = [201, 202, 203, 204, 205]  # len 5
@@ -164,21 +171,21 @@ class TestPreprocessPackedRows:
 
         sequences, attention_mask, sub_seq_lengths = _build_collator_layout(
             [[row_0_sub_0, row_0_sub_1], [row_1_sub_0, row_1_sub_1]],
-            align_size=tp_size,
+            align_size=align_size,
         )
 
         # Sanity: collator layout matches what PackedDataCollator does.
-        #   row 0: [101..107] + [pad] + [201..205] + [pad, pad, pad]  => 16 slots
-        #   row 1: [301..303] + [pad] + [401..411] + [pad]            => 16 slots
-        assert sequences.shape == (2, 16)
+        #   row 0: [101..107] + pad-to-16 + [201..205] + pad-to-16 => 32 slots
+        #   row 1: [301..303] + pad-to-16 + [401..411] + pad-to-16 => 32 slots
+        assert sequences.shape == (2, 32)
         assert sequences[0, :7].tolist() == row_0_sub_0
-        assert sequences[0, 7].item() == 0
-        assert sequences[0, 8:13].tolist() == row_0_sub_1
+        assert sequences[0, 7:16].tolist() == [0] * 9
+        assert sequences[0, 16:21].tolist() == row_0_sub_1
         assert sequences[1, :3].tolist() == row_1_sub_0
-        assert sequences[1, 3].item() == 0
-        assert sequences[1, 4:15].tolist() == row_1_sub_1
+        assert sequences[1, 3:16].tolist() == [0] * 13
+        assert sequences[1, 16:27].tolist() == row_1_sub_1
         # attention_mask is True ONLY at valid slots (NOT at TP-alignment gaps).
-        assert attention_mask[0, 7].item() is False
+        assert attention_mask[0, 7:16].any().item() is False
         assert attention_mask[0].sum().item() == 7 + 5
         assert attention_mask[1].sum().item() == 3 + 11
 
@@ -197,21 +204,19 @@ class TestPreprocessPackedRows:
             )
 
         # cu_seqlens_q (== cu_seqlens_q_padded for THD) enumerates 4 sub-seqs:
-        #   row 0: 0 -> ceil(7/4)*4=8 -> 8+ceil(5/4)*4=16
-        #   row 1: 16 -> 16+ceil(3/4)*4=20 -> 20+ceil(11/4)*4=32
-        assert params.cu_seqlens_q.tolist() == [0, 8, 16, 20, 32]
-        # Packed slab is 32 tokens. Verify each sub-seq's *valid* tokens were
+        assert params.cu_seqlens_q.tolist() == [0, 16, 32, 48, 64]
+        # Packed slab is 64 tokens. Verify each sub-seq's *valid* tokens were
         # read from the *correct intra-row offset* — i.e. preprocess respected
         # the TP-alignment gap that the collator inserted.
-        assert packed.shape == (1, 32)
+        assert packed.shape == (1, 64)
         assert packed[0, :7].tolist() == row_0_sub_0  # row 0 sub 0
-        assert packed[0, 7].item() == 0  # TP-alignment pad
-        assert packed[0, 8:13].tolist() == row_0_sub_1  # row 0 sub 1
-        assert packed[0, 13:16].tolist() == [0, 0, 0]  # TP-alignment pad
-        assert packed[0, 16:19].tolist() == row_1_sub_0  # row 1 sub 0
-        assert packed[0, 19].item() == 0  # TP-alignment pad
-        assert packed[0, 20:31].tolist() == row_1_sub_1  # row 1 sub 1
-        assert packed[0, 31].item() == 0  # TP-alignment pad
+        assert packed[0, 7:16].tolist() == [0] * 9  # alignment pad
+        assert packed[0, 16:21].tolist() == row_0_sub_1  # row 0 sub 1
+        assert packed[0, 21:32].tolist() == [0] * 11  # alignment pad
+        assert packed[0, 32:35].tolist() == row_1_sub_0  # row 1 sub 0
+        assert packed[0, 35:48].tolist() == [0] * 13  # alignment pad
+        assert packed[0, 48:59].tolist() == row_1_sub_1  # row 1 sub 1
+        assert packed[0, 59:64].tolist() == [0] * 5  # alignment pad
 
     def test_mbs2_tp1_singlesubseq_rows_match_legacy_preprocess_path(self):
         """No regression in the legacy path: when each row has 1 sub-seq and tp_size=1."""
@@ -220,7 +225,7 @@ class TestPreprocessPackedRows:
         )
 
         sequences, attention_mask, sub_seq_lengths = _build_collator_layout(
-            [[[1, 2, 3, 4, 5]], [[10, 11, 12]]], align_size=1
+            [[[1, 2, 3, 4, 5]], [[10, 11, 12]]], align_size=_get_align_size(1, 1)
         )
 
         with patch(
