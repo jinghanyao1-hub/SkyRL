@@ -34,7 +34,6 @@ from skyrl.backends.skyrl_train.weight_sync.transfer_strategy import (
     WeightTransferSender,
     WeightTransferStrategy,
 )
-from skyrl.train.utils.utils import str_to_torch_dtype
 
 # IPC handle type: (rebuild_func, args) returned by reduce_tensor
 IpcHandle = Tuple[Callable[..., torch.Tensor], Tuple[Any, ...]]
@@ -56,6 +55,42 @@ class CudaIpcInitInfo(WeightSyncInitInfo):
 
 
 _IPC_REQUEST_END_MARKER = b"__END_OF_REQUEST__"
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).split(".")[-1]
+
+
+def _iter_single_dtype_chunks(chunk: WeightChunk) -> Iterable[WeightChunk]:
+    """Yield chunks whose tensors all share one dtype.
+
+    A logical checkpoint-format update may contain mixed dtypes, e.g. FP8
+    weights and FP32 ``weight_scale_inv`` tensors. Each packed CUDA IPC buffer
+    must still have one dtype, so split by actual tensor dtype while preserving
+    the first-seen dtype order.
+    """
+
+    by_dtype: Dict[torch.dtype, Dict[str, list]] = {}
+    dtype_order: list[torch.dtype] = []
+    for name, _dtype_str, shape, tensor in zip(chunk.names, chunk.dtypes, chunk.shapes, chunk.tensors):
+        dtype = tensor.dtype
+        if dtype not in by_dtype:
+            dtype_order.append(dtype)
+            by_dtype[dtype] = {"names": [], "dtypes": [], "shapes": [], "tensors": []}
+        group = by_dtype[dtype]
+        group["names"].append(name)
+        group["dtypes"].append(str(dtype))
+        group["shapes"].append(shape)
+        group["tensors"].append(tensor)
+
+    for dtype in dtype_order:
+        group = by_dtype[dtype]
+        yield WeightChunk(
+            names=group["names"],
+            dtypes=group["dtypes"],
+            shapes=group["shapes"],
+            tensors=group["tensors"],
+        )
 
 
 @dataclass
@@ -186,75 +221,95 @@ class CudaIpcWeightTransferSender(WeightTransferSender):
         world_size = torch.distributed.get_world_size()
         device = torch.cuda.current_device()
         gpu_uuid = str(torch.cuda.get_device_properties(device).uuid)
-        dtype = str_to_torch_dtype(self._init_info.model_dtype_str)
-        dtype_name = self._init_info.model_dtype_str.split(".")[-1]
-
         if rank == 0:
             await self._inference_client.start_weight_update(is_checkpoint_format=True)
         torch.distributed.barrier()
 
-        for chunk in chunks:
-            # --- pack all tensors in this chunk into one contiguous buffer ---
-            # Chunk tensors share a single dtype by construction (see
-            # weight_extractor_utils.py), so offsets in element units are safe.
-            names: List[str] = []
-            dtype_names: List[str] = []
-            shapes: List[List[int]] = []
-            sizes: List[int] = []
-
-            total_numel = sum(t.numel() for t in chunk.tensors)
-            packed_tensor = torch.empty(
-                total_numel,
-                device=device,
-                dtype=dtype,
-                requires_grad=False,
-            )
-
-            offset = 0
-            for name, tensor, shape in zip(chunk.names, chunk.tensors, chunk.shapes):
-                size = tensor.numel()
-                packed_tensor[offset : offset + size].copy_(tensor.detach().reshape(-1))
-                offset += size
-                names.append(name)
-                dtype_names.append(dtype_name)
-                shapes.append(list(shape) if not isinstance(shape, list) else shape)
-                sizes.append(size)
-
-            # --- one IPC handle per rank for the packed buffer ---
-            ipc_handle: IpcHandle = reduce_tensor(packed_tensor)
-            local_handle_dict: Dict[str, IpcHandle] = {gpu_uuid: ipc_handle}
-            gathered: List[Optional[Dict[str, IpcHandle]]] = [None] * world_size
-            torch.distributed.all_gather_object(gathered, local_handle_dict)
-
-            torch.distributed.barrier()
-            torch.cuda.synchronize()
-
-            if rank == 0:
-                merged_handles: Dict[str, IpcHandle] = {}
-                for d in gathered:
-                    if d is not None:
-                        merged_handles.update(d)
-
-                pickled = base64.b64encode(pickle.dumps(merged_handles)).decode("utf-8")
-                chunk_update_info: Dict[str, Any] = {
-                    "names": names,
-                    "dtype_names": dtype_names,
-                    "shapes": shapes,
-                    "sizes": sizes,
-                    "ipc_handles_pickled": pickled,
-                }
-                await self._inference_client.update_weights_ipc(chunk_update_info)
-
-            # Keep packed_tensor alive past the barrier so the receiver's
-            # rebuilt view has valid backing storage while it copies into
-            # the model. Post-barrier drops the local ref safely.
-            torch.distributed.barrier()
-            torch.cuda.ipc_collect()
-            torch.cuda.synchronize()
+        for logical_chunk in chunks:
+            for chunk in _iter_single_dtype_chunks(logical_chunk):
+                await self._send_single_dtype_chunk_vllm_native(
+                    chunk=chunk,
+                    device=device,
+                    gpu_uuid=gpu_uuid,
+                    world_size=world_size,
+                    rank=rank,
+                )
 
         if rank == 0:
             await self._inference_client.finish_weight_update()
         torch.distributed.barrier()
+
+    async def _send_single_dtype_chunk_vllm_native(
+        self,
+        *,
+        chunk: WeightChunk,
+        device: int,
+        gpu_uuid: str,
+        world_size: int,
+        rank: int,
+    ) -> None:
+        dtype = chunk.tensors[0].dtype
+        dtype_name = _dtype_name(dtype)
+        if any(tensor.dtype != dtype for tensor in chunk.tensors):
+            raise ValueError("CUDA IPC packed chunks must contain a single tensor dtype")
+
+        # --- pack all tensors in this chunk into one contiguous buffer ---
+        # Chunk tensors share a single dtype by construction, so offsets in
+        # element units are safe.
+        names: List[str] = []
+        dtype_names: List[str] = []
+        shapes: List[List[int]] = []
+        sizes: List[int] = []
+
+        total_numel = sum(t.numel() for t in chunk.tensors)
+        packed_tensor = torch.empty(
+            total_numel,
+            device=device,
+            dtype=dtype,
+            requires_grad=False,
+        )
+
+        offset = 0
+        for name, tensor, shape in zip(chunk.names, chunk.tensors, chunk.shapes):
+            size = tensor.numel()
+            packed_tensor[offset : offset + size].copy_(tensor.detach().reshape(-1))
+            offset += size
+            names.append(name)
+            dtype_names.append(dtype_name)
+            shapes.append(list(shape) if not isinstance(shape, list) else shape)
+            sizes.append(size)
+
+        # --- one IPC handle per rank for the packed buffer ---
+        ipc_handle: IpcHandle = reduce_tensor(packed_tensor)
+        local_handle_dict: Dict[str, IpcHandle] = {gpu_uuid: ipc_handle}
+        gathered: List[Optional[Dict[str, IpcHandle]]] = [None] * world_size
+        torch.distributed.all_gather_object(gathered, local_handle_dict)
+
+        torch.distributed.barrier()
+        torch.cuda.synchronize()
+
+        if rank == 0:
+            merged_handles: Dict[str, IpcHandle] = {}
+            for d in gathered:
+                if d is not None:
+                    merged_handles.update(d)
+
+            pickled = base64.b64encode(pickle.dumps(merged_handles)).decode("utf-8")
+            chunk_update_info: Dict[str, Any] = {
+                "names": names,
+                "dtype_names": dtype_names,
+                "shapes": shapes,
+                "sizes": sizes,
+                "ipc_handles_pickled": pickled,
+            }
+            await self._inference_client.update_weights_ipc(chunk_update_info)
+
+        # Keep packed_tensor alive past the barrier so the receiver's
+        # rebuilt view has valid backing storage while it copies into
+        # the model. Post-barrier drops the local ref safely.
+        torch.distributed.barrier()
+        torch.cuda.ipc_collect()
+        torch.cuda.synchronize()
 
     def teardown(self) -> None:
         """No-op for CUDA IPC sender (no custom process group to clean up)."""

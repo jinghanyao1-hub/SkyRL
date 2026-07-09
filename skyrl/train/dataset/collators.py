@@ -135,15 +135,17 @@ class PackedDataCollator:
         pp_size = self.pp_size
         cp_size = self.cp_size
         # Each sub-seq's padded length must satisfy these divisibility
-        # constraints, which is why ``align_size`` carries all factors:
+        # constraints, which is why ``align_size`` carries all required factors:
         #   - Sequence Parallelism (auto-on when tp>1) shards along the seq
         #     dim, so each segment must be divisible by ``tp_size``.
         #   - Context Parallelism splits each segment into ``2*cp_size`` equal
         #     load-balanced causal chunks, so each segment must be divisible by
         #     ``2*cp_size``.
-        #   - When FP8 is enabled, Transformer Engine GEMMs require each CP
-        #     rank's local token slab to be 16-aligned; globally this means
-        #     ``16*cp_size``.
+        #   - Transformer Engine FP8 GEMMs require local token slabs to be
+        #     aligned. With TP > 1, Megatron sequence parallelism makes TE
+        #     blockwise FP8 quantize the input all-gather source, whose local
+        #     flattened token dim must be 128-aligned. The global row footprint
+        #     therefore carries the TP and CP shard factors.
         # This MUST stay in lockstep with the worker's preprocess_packed_seqs
         # (megatron_utils.py): if the divisors drift, the per-rank CP/SP
         # gather/scatter offsets silently corrupt loss/grads (no crash).

@@ -11,6 +11,7 @@ from skyrl.env_vars import SKYRL_RAY_PG_TIMEOUT_IN_S
 from skyrl.train.config import InferenceEngineConfig, SkyRLTrainConfig
 from skyrl.train.utils.utils import (
     ResolvedPlacementGroup,
+    apply_skyrl_node_resource,
     get_ray_pg_ready_with_timeout,
 )
 
@@ -88,12 +89,14 @@ def create_inference_servers(
         if placement_group is None:
             prefill_total_gpus = num_prefill * gpus_per_server * servers_per_group
             prefill_bundles = [{"GPU": 1, "CPU": 1} for _ in range(prefill_total_gpus)]
+            prefill_bundles = apply_skyrl_node_resource(prefill_bundles)
             raw_prefill_pg = ray_placement_group(prefill_bundles, strategy="PACK")
             get_ray_pg_ready_with_timeout(raw_prefill_pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
             prefill_pg = ResolvedPlacementGroup(raw_prefill_pg)
 
             decode_total_gpus = num_decode * gpus_per_server * servers_per_group
             decode_bundles = [{"GPU": 1, "CPU": 1} for _ in range(decode_total_gpus)]
+            decode_bundles = apply_skyrl_node_resource(decode_bundles)
             raw_decode_pg = ray_placement_group(decode_bundles, strategy="PACK")
             get_ray_pg_ready_with_timeout(raw_decode_pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
             decode_pg = ResolvedPlacementGroup(raw_decode_pg)
@@ -176,6 +179,7 @@ def create_inference_servers(
         if placement_group is None:
             total_gpus = ie_cfg.num_engines * gpus_per_server * ie_cfg.data_parallel_size
             bundles = [{"GPU": 1, "CPU": 1} for _ in range(total_gpus)]
+            bundles = apply_skyrl_node_resource(bundles)
             raw_pg = ray_placement_group(bundles, strategy="PACK")
             get_ray_pg_ready_with_timeout(raw_pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
             placement_group = ResolvedPlacementGroup(raw_pg)

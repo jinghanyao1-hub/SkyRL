@@ -19,7 +19,7 @@ from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
 )
 from skyrl.backends.skyrl_train.inference_servers.protocols import ServerActorProtocol
 from skyrl.backends.skyrl_train.inference_servers.server_pool import ServerActorPool
-from skyrl.train.utils.utils import ResolvedPlacementGroup
+from skyrl.train.utils.utils import ResolvedPlacementGroup, apply_skyrl_node_resource
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +122,8 @@ class ServerGroup:
         """Create an internal placement group with per-GPU bundles."""
         total_bundles = self._num_servers * self._num_gpus_per_server
         logger.info(f"Creating placement group with {total_bundles} bundles...")
-        pg = placement_group([{"CPU": 1, "GPU": 1} for _ in range(total_bundles)])
+        bundles = apply_skyrl_node_resource([{"CPU": 1, "GPU": 1} for _ in range(total_bundles)])
+        pg = placement_group(bundles)
         ray.get(pg.ready())
         skyrl_pg = ResolvedPlacementGroup(pg)
         self._reordered_bundle_indices = skyrl_pg.reordered_bundle_indices

@@ -256,6 +256,38 @@ class TestPackingCollator:
             padded = ((s + 31) // 32) * 32
             assert (padded // 2) % 16 == 0
 
+    def test_fp8_alignment_is_conditional(self):
+        examples = [
+            _make_example(3, 1, base_token=100),
+            _make_example(3, 1, base_token=200),
+        ]
+
+        bf16 = _make_collator(num_gpus=1, batch_size=2, max_length=64, fp8=False)
+        bf16_batch = bf16(examples, batch_size=2)
+        assert bf16_batch["sequences"].shape[1] == 6
+        bf16_chunks = [bf16_batch["sequences"][0, :3].tolist(), bf16_batch["sequences"][0, 3:6].tolist()]
+        assert sorted(bf16_chunks) == [[100, 101, 102], [200, 201, 202]]
+
+        fp8 = _make_collator(num_gpus=1, batch_size=2, max_length=64, fp8=True)
+        fp8_batch = fp8(examples, batch_size=2)
+        assert fp8_batch["sequences"].shape[1] == 32
+        fp8_chunks = [fp8_batch["sequences"][0, :3].tolist(), fp8_batch["sequences"][0, 16:19].tolist()]
+        assert sorted(fp8_chunks) == [[100, 101, 102], [200, 201, 202]]
+
+    def test_tp_gt_1_fp8_alignment_uses_local_128(self):
+        """TP>1 FP8 row layout must satisfy TE blockwise input all-gather."""
+        examples = [
+            _make_example(3, 1, base_token=100),
+            _make_example(3, 1, base_token=200),
+        ]
+
+        fp8 = _make_collator(num_gpus=2, batch_size=2, max_length=512, tp=2, fp8=True)
+        fp8_batch = fp8(examples, batch_size=2)
+
+        assert fp8_batch["sequences"].shape[1] == 512
+        fp8_chunks = [fp8_batch["sequences"][0, :3].tolist(), fp8_batch["sequences"][0, 256:259].tolist()]
+        assert sorted(fp8_chunks) == [[100, 101, 102], [200, 201, 202]]
+
     def test_eval_path_falls_back_to_super(self):
         """When batch_size != self.sft_cfg.batch_size (eval), no packing happens."""
         collator = _make_collator(num_gpus=1, batch_size=4, max_length=64)

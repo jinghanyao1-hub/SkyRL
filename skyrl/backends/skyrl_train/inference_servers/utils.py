@@ -11,6 +11,12 @@ from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import
     SKYRL_LORA_ADAPTER_NAME,
 )
 from skyrl.backends.skyrl_train.weight_sync import get_transfer_strategy
+from skyrl.backends.skyrl_train.weight_sync.serialized_fp8 import (
+    SERIALIZED_BLOCKWISE_FP8,
+    get_qwen35_slime_parity_modules_to_not_convert,
+    get_serialized_fp8_quantization_config,
+    should_use_serialized_fp8,
+)
 from skyrl.train.config import (
     InferenceEngineConfig,
     SkyRLTrainConfig,
@@ -18,6 +24,85 @@ from skyrl.train.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _serialized_fp8_modules_to_not_convert(model_path: Optional[str]) -> list[str]:
+    if not model_path:
+        return []
+    try:
+        from transformers import AutoConfig
+
+        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    except Exception as exc:
+        logger.warning(
+            "Could not inspect model config for serialized FP8 ignored layers; "
+            "continuing with no ignored layers. model_path=%s error=%s",
+            model_path,
+            exc,
+        )
+        return []
+    return get_qwen35_slime_parity_modules_to_not_convert(hf_config)
+
+
+def _apply_serialized_fp8_weight_sync_defaults(
+    ie_cfg: InferenceEngineConfig,
+    engine_kwargs: Dict[str, Any],
+    model_path: Optional[str] = None,
+) -> None:
+    """Configure vLLM for checkpoint-format blockwise FP8 weight reloads."""
+
+    mode = ie_cfg.fp8_weight_sync_mode
+    if mode is None:
+        return
+    if not should_use_serialized_fp8(mode):
+        raise ValueError(
+            f"Unsupported fp8_weight_sync_mode={mode!r}. "
+            f"Supported value: {SERIALIZED_BLOCKWISE_FP8!r}."
+        )
+
+    engine_kwargs.setdefault("quantization", "fp8")
+    # vLLM must build serialized-FP8 modules before SkyRL's first weight sync.
+    # The initial values are immediately overwritten by Megatron weight sync, so
+    # avoid requiring an on-disk FP8 bootstrap checkpoint.
+    engine_kwargs.setdefault("load_format", "dummy")
+
+    # Qwen3.5 checkpoints (dense and MoE) carry a vision tower under a VL wrapper
+    # arch. vLLM builds and FP8-quantizes that tower unless multimodal inputs are
+    # disabled, and its vision linears can have dims not divisible by the FP8 block
+    # size (e.g. 576) -> ``validate_fp8_block_shape`` raises at engine init. Text-only
+    # RL never uses the tower, so when ``language_model_only`` is set, disable mm
+    # inputs. vLLM's ``_mark_tower_model`` then skips building the tower entirely
+    # (``get_limit_per_prompt(image/video) == 0``), avoiding the FP8 block-shape check.
+    if ie_cfg.language_model_only:
+        engine_kwargs.setdefault("limit_mm_per_prompt", {"image": 0, "video": 0})
+
+    hf_overrides = copy.deepcopy(engine_kwargs.get("hf_overrides") or {})
+    if not isinstance(hf_overrides, dict):
+        raise ValueError(
+            "engine_init_kwargs.hf_overrides must be a dict when serialized FP8 weight sync is enabled"
+        )
+
+    qcfg = copy.deepcopy(hf_overrides.get("quantization_config") or {})
+    if not isinstance(qcfg, dict):
+        raise ValueError(
+            "engine_init_kwargs.hf_overrides.quantization_config must be a dict "
+            "when serialized FP8 weight sync is enabled"
+        )
+
+    modules_to_not_convert = _serialized_fp8_modules_to_not_convert(model_path)
+    if modules_to_not_convert:
+        logger.info(
+            "Serialized FP8 weight sync will leave %d vLLM modules unquantized "
+            "to match the Qwen3.5 Slime FP8 sync policy.",
+            len(modules_to_not_convert),
+        )
+
+    for key, value in get_serialized_fp8_quantization_config(
+        modules_to_not_convert=modules_to_not_convert,
+    ).items():
+        qcfg.setdefault(key, value)
+    hf_overrides["quantization_config"] = qcfg
+    engine_kwargs["hf_overrides"] = hf_overrides
 
 
 def _uses_lora_weight_sync(cfg: SkyRLTrainConfig) -> bool:
@@ -145,6 +230,11 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
 
     # Add any extra engine_init_kwargs
     engine_kwargs = get_config_as_dict(ie_cfg.engine_init_kwargs)
+    _apply_serialized_fp8_weight_sync_defaults(
+        ie_cfg,
+        engine_kwargs,
+        cfg.trainer.policy.model.path,
+    )
     for key, value in engine_kwargs.items():
         setattr(args, key, value)
 

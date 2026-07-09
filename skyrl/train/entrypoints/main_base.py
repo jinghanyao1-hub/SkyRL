@@ -24,6 +24,7 @@ from skyrl.train.utils import validate_cfg
 from skyrl.train.utils.tracking import Tracking
 from skyrl.train.utils.utils import (
     ResolvedPlacementGroup,
+    apply_skyrl_node_resource,
     get_ray_pg_ready_with_timeout,
     initialize_ray,
 )
@@ -121,10 +122,8 @@ class BasePPOExp:
         per_engine_gpu_count = ie_cfg.tensor_parallel_size * ie_cfg.pipeline_parallel_size * ie_cfg.data_parallel_size
         total_gpu_slots = ie_cfg.num_engines * per_engine_gpu_count
 
-        pg = placement_group(
-            [{"GPU": 1, "CPU": 1}] * total_gpu_slots,
-            strategy="PACK",
-        )
+        bundles = apply_skyrl_node_resource([{"GPU": 1, "CPU": 1}] * total_gpu_slots)
+        pg = placement_group(bundles, strategy="PACK")
         get_ray_pg_ready_with_timeout(pg, timeout=timeout)
         return ResolvedPlacementGroup(pg)
 

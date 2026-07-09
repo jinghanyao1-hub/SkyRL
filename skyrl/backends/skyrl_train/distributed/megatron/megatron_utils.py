@@ -243,12 +243,13 @@ def offload_megatron_model_to_cpu(models):
                 # https://github.com/NVIDIA/Megatron-LM/blob/core_v0.16.0/megatron/core/distributed/param_and_grad_buffer.py#L964
                 buffer.offload_to_cpu(move_params=True, move_grads=False)
 
-            # LoRA-aware offloading: offload non-lora base weights that live
-            # outside the fused Megatron buffers (e.g. HF/bridge "to_wrap" weights).
+            # Offload residual weights that live outside the fused Megatron
+            # buffers (e.g. HF/bridge "to_wrap" weights). Some ref-model
+            # parameters may still have requires_grad=True even though the ref
+            # actor has no optimizer, so do not key this cleanup off grad flags.
             for name, param in model_chunk.named_parameters():
                 if (
                     param.is_cuda
-                    and not param.requires_grad
                     and "adapter" not in name
                     and param.data.storage().size() > 0
                 ):

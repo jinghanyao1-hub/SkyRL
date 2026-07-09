@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
@@ -99,6 +100,15 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _residual_hbm_bytes(record: Dict[str, Any]) -> int:
+    """Best-effort residual HBM for a slept inference server process."""
+    for key in ("process_used_bytes", "nvml_used_bytes", "reserved_bytes", "allocated_bytes"):
+        value = record.get(key)
+        if value is not None:
+            return int(value)
+    return 0
 
 
 def _extract_session_id_and_body(
@@ -1057,6 +1067,112 @@ class RemoteInferenceClient(InferenceEngineInterface):
             Dict mapping server_url to response.
         """
         return await self._call_all_servers("/reset_prefix_cache", {"reset_running_requests": reset_running_requests})
+
+    async def release_cuda_memory(self) -> Dict[str, Any]:
+        """Ask all inference servers to run process-local CUDA cache cleanup."""
+        return await self._call_all_servers("/release_cuda_memory")
+
+    async def cuda_memory_stats(self) -> Dict[str, Any]:
+        """Return process-local CUDA/NVML memory stats from all inference servers."""
+        return await self._call_all_servers("/cuda_memory_stats")
+
+    async def sleep_for_training(
+        self,
+        *,
+        phase: str = "training",
+        level: int = 2,
+        residual_hbm_threshold_gb: float = 2.0,
+        timeout_s: float = 30.0,
+        poll_s: float = 1.0,
+        enabled: bool = True,
+        hard_evict_on_breach: bool = False,
+    ) -> Dict[str, Any]:
+        """Sleep rollout servers and optionally wait for residual HBM to drop below a threshold."""
+        if not enabled:
+            return {"sleep": await self.sleep(level=level)}
+
+        start = time.monotonic()
+        try:
+            reset_result = await self.reset_prefix_cache(reset_running_requests=False)
+        except Exception as exc:
+            logger.warning("Failed to reset inference prefix cache before %s sleep: %s", phase, exc)
+            reset_result = {"error": repr(exc)}
+
+        sleep_result = await self.sleep(level=level)
+
+        try:
+            release_result = await self.release_cuda_memory()
+        except Exception as exc:
+            logger.warning("Failed to request inference CUDA cleanup after sleep: %s", exc)
+            release_result = {"error": repr(exc)}
+
+        threshold_bytes = max(0.0, float(residual_hbm_threshold_gb)) * (1024**3)
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        poll_interval = max(0.1, float(poll_s))
+        last_stats: Dict[str, Any] = {}
+        last_over_threshold: List[Tuple[str, int]] = []
+
+        while True:
+            stats_error = None
+            try:
+                last_stats = await self.cuda_memory_stats()
+            except Exception as exc:
+                stats_error = exc
+                logger.warning("Failed to fetch inference CUDA memory stats after sleep: %s", exc)
+                last_stats = {"error": repr(exc)}
+
+            if stats_error is None:
+                records: List[Tuple[str, Dict[str, Any]]] = []
+                for url, response in last_stats.items():
+                    if not isinstance(response, dict):
+                        continue
+                    body = response.get("body")
+                    if isinstance(body, dict):
+                        records.append((url, body))
+
+                last_over_threshold = [
+                    (url, _residual_hbm_bytes(record))
+                    for url, record in records
+                    if _residual_hbm_bytes(record) > threshold_bytes
+                ]
+                if records and not last_over_threshold:
+                    elapsed = time.monotonic() - start
+                    logger.info(
+                        "Inference sleep barrier passed for %s in %.3fs; threshold=%.2f GiB",
+                        phase,
+                        elapsed,
+                        threshold_bytes / (1024**3),
+                    )
+                    return {
+                        "reset_prefix_cache": reset_result,
+                        "sleep": sleep_result,
+                        "release_cuda_memory": release_result,
+                        "cuda_memory_stats": last_stats,
+                    }
+
+            if time.monotonic() >= deadline:
+                over_summary = ", ".join(
+                    f"{url}={used / (1024**3):.2f}GiB" for url, used in last_over_threshold
+                )
+                message = (
+                    f"Inference sleep barrier timed out for {phase}: threshold="
+                    f"{threshold_bytes / (1024**3):.2f} GiB"
+                )
+                if over_summary:
+                    message = f"{message}; over_threshold={over_summary}"
+                if hard_evict_on_breach:
+                    raise RuntimeError(
+                        f"{message}. Inference hard eviction is not implemented for HTTP vLLM servers."
+                    )
+                logger.warning(message)
+                return {
+                    "reset_prefix_cache": reset_result,
+                    "sleep": sleep_result,
+                    "release_cuda_memory": release_result,
+                    "cuda_memory_stats": last_stats,
+                }
+
+            await asyncio.sleep(poll_interval)
 
     # ---------------------------
     # Weight Sync (control plane - fan-out)

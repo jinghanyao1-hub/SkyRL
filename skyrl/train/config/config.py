@@ -349,6 +349,21 @@ class PlacementConfig(BaseConfig):
     critic_num_gpus_per_node: int = 1
     ref_num_nodes: int = 1
     ref_num_gpus_per_node: int = 1
+    colocated_inference_memory_barrier: bool = False
+    """Sleep colocated inference engines and verify residual HBM before training."""
+    colocated_inference_sleep_level: int = 2
+    colocated_inference_residual_hbm_threshold_gb: float = 2.0
+    colocated_inference_memory_barrier_timeout_s: float = 30.0
+    colocated_inference_memory_barrier_poll_s: float = 1.0
+    colocated_inference_hard_evict_on_breach: bool = False
+    """Reserved for clients with inference-engine restart support; current HTTP client fails fast."""
+    colocated_worker_memory_barrier: bool = False
+    """Check inactive colocated worker residual HBM after CPU offload."""
+    colocated_worker_residual_hbm_threshold_gb: float = 2.0
+    colocated_ref_hard_evict_on_breach: bool = False
+    """Kill/restart inactive ref workers when residual HBM remains above threshold."""
+    colocated_worker_evict_wait_s: float = 30.0
+    colocated_worker_evict_poll_s: float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +554,8 @@ class AlgorithmConfig(BaseConfig):
     value_head_prefix: str = "value_head"
     policy_loss_type: str = "regular"
     """``"regular"``, ``"dual_clip"``, ``"gspo"``, ``"clip_cov"``, ``"kl_cov"``, ``cispo``, ``sapo``, ``"rollout_is"``, ``"dppo"``, or custom via ``PolicyLossRegistry``."""
+    use_current_policy_logprobs_as_old: bool = False
+    """Compatibility-only flag for older H100 launch wrappers. Must remain ``False``."""
     loss_reduction: str = "token_mean"
     """``"token_mean"``, ``"sequence_mean"``, ``"prompt_mean"``, or ``"seq_mean_token_sum_norm"``. ``max_seq_len`` must be set explicitly for ``"seq_mean_token_sum_norm"``."""
     grpo_norm_by_std: bool = True
@@ -659,6 +676,10 @@ class InferenceEngineConfig(BaseConfig):
 
     model_dtype: str = "bfloat16"
     """Should match the dtype used by the inference engine."""
+    fp8_weight_sync_mode: Optional[str] = None
+    """Optional rollout weight-sync FP8 format. ``"serialized_blockwise"`` makes
+    Megatron weight sync send checkpoint-format FP8 weights plus scale tensors to
+    the inference engine instead of sending ``model_dtype`` weights."""
     run_engines_locally: bool = True
     num_engines: int = 1
     backend: str = "vllm"
@@ -884,6 +905,12 @@ class TrainerConfig(BaseConfig):
     This lowers peak GPU memory at the cost of ~2x wall-clock time.
     ``None`` disables chunking (Megatron backend only; FSDP requires a positive int).
     See https://github.com/NovaSky-AI/SkyRL/pull/1610 for more details."""
+    vocab_entropy_chunk_size: Optional[int] = 0
+    """Chunk size along the sequence dimension when computing Megatron vocab entropy.
+    ``0`` auto-sizes from the local vocab shard size and ``vocab_entropy_chunk_memory_mb``.
+    ``None`` preserves the legacy unchunked path."""
+    vocab_entropy_chunk_memory_mb: int = 512
+    """Approximate per-chunk temporary memory budget for auto-sized Megatron vocab entropy chunks."""
     fused_lm_head_logprob: bool = False
     """Megatron only. Fuse the LM-head projection into log-prob / entropy
     computation so the full ``[B, S, vocab//TP]`` logits tensor is never
@@ -918,6 +945,21 @@ class TrainerConfig(BaseConfig):
             raise ValueError(
                 "fused_lm_head_logprob_backend must be 'torch' or 'triton', "
                 f"got {self.fused_lm_head_logprob_backend!r}."
+            )
+        if self.vocab_entropy_chunk_size is not None and (
+            not isinstance(self.vocab_entropy_chunk_size, int) or self.vocab_entropy_chunk_size < 0
+        ):
+            raise ValueError(
+                "vocab_entropy_chunk_size must be a non-negative integer or None, "
+                f"got {self.vocab_entropy_chunk_size!r}."
+            )
+        if (
+            not isinstance(self.vocab_entropy_chunk_memory_mb, int)
+            or self.vocab_entropy_chunk_memory_mb <= 0
+        ):
+            raise ValueError(
+                "vocab_entropy_chunk_memory_mb must be a positive integer, "
+                f"got {self.vocab_entropy_chunk_memory_mb!r}."
             )
 
 

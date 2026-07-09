@@ -49,6 +49,17 @@ from skyrl.backends.skyrl_train.weight_sync import (
     WeightChunk,
     WeightExtractor,
 )
+from skyrl.backends.skyrl_train.weight_sync.serialized_fp8 import (
+    SerializedFp8Config,
+    iter_shared_blockwise_fp8_tensors,
+    iter_serialized_fp8_metadata,
+    iter_serialized_fp8_tensors,
+    shared_blockwise_fp8_group,
+    should_use_serialized_fp8,
+)
+from skyrl.backends.skyrl_train.workers.megatron._fp8_block_amax_epsilon_patch import (
+    apply_fp8_block_amax_epsilon_patch,
+)
 from skyrl.backends.skyrl_train.workers.megatron.adapter_store import (
     AdapterStore,
     LoraSignature,
@@ -87,6 +98,22 @@ from skyrl.backends.skyrl_train.workers.megatron.model_bridges import (
 )
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    return raw_value.lower() in {"1", "true", "yes", "on"}
+
+
+# Apply the TE Float8BlockScaling amax_epsilon floor at the earliest possible point
+# in every worker process (no-op unless NVTE_FP8_BLOCK_AMAX_EPSILON is set > 0). This
+# is safe here: Megatron builds the FP8 recipe lazily inside
+# megatron.core.fp8_utils.get_fp8_context (called per forward pass / at fp8_model_init),
+# never at import time -- so patching the recipe class now is guaranteed to precede any
+# recipe/quantizer construction. It is also re-applied at the top of init_model() below.
+apply_fp8_block_amax_epsilon_patch()
+
+
 class MegatronWeightExtractor(WeightExtractor):
     """Extracts weights from Megatron model-parallel models.
 
@@ -107,12 +134,14 @@ class MegatronWeightExtractor(WeightExtractor):
         enable_bucketing: bool = False,
         bucket_size_threshold_GB: float = 1.0,
         training_dtype: torch.dtype = torch.bfloat16,
+        fp8_weight_sync_mode: Optional[str] = None,
     ):
         self.bridge = bridge
         self.actor_module = actor_module
         self.enable_bucketing = enable_bucketing
         self.bucket_size_threshold_GB = bucket_size_threshold_GB
         self.training_dtype = training_dtype
+        self.serialized_fp8_config = SerializedFp8Config() if should_use_serialized_fp8(fp8_weight_sync_mode) else None
 
         # Defer bucket init to first extract_weights call.
         # At __init__ time the model may be CPU-offloaded (colocate_all),
@@ -121,6 +150,14 @@ class MegatronWeightExtractor(WeightExtractor):
         # called prepare_for_weight_sync → _ensure_on_gpu.
         self.bucket_index_groups = None
         self._buckets_initialized = False
+
+    @staticmethod
+    def _unpack_hf_weight(exported_weight) -> tuple[str, torch.Tensor]:
+        """Normalize Megatron Bridge HF export tuples across Bridge versions."""
+        if len(exported_weight) < 2:
+            raise ValueError(f"Unexpected export_hf_weights item: {exported_weight!r}")
+        name, tensor = exported_weight[:2]
+        return name, tensor
 
     def _init_param_buckets(self):
         """Compute bucket boundaries (index groups) from parameter sizes.
@@ -217,18 +254,28 @@ class MegatronWeightExtractor(WeightExtractor):
         names = []
         dtype_names = []
         shapes = []
-        dtype_name = str(dtype).split(".")[-1]
         # Collect parameter metadata in the same order
         # as provided by `.extract_weights`.
         if not self.enable_bucketing:
-            for name, tensor in self.bridge.export_hf_weights(
+            for exported_weight in self.bridge.export_hf_weights(
                 self.actor_module,
                 show_progress=False,
                 conversion_tasks=None,
             ):
-                names.append(name)
-                dtype_names.append(dtype_name)
-                shapes.append(list(tensor.shape))
+                name, tensor = self._unpack_hf_weight(exported_weight)
+                if self.serialized_fp8_config is not None:
+                    metadata_iter = iter_serialized_fp8_metadata(
+                        name,
+                        list(tensor.shape),
+                        dtype,
+                        self.serialized_fp8_config,
+                    )
+                else:
+                    metadata_iter = [(name, dtype, list(tensor.shape))]
+                for out_name, out_dtype, out_shape in metadata_iter:
+                    names.append(out_name)
+                    dtype_names.append(str(out_dtype).split(".")[-1])
+                    shapes.append(out_shape)
                 del tensor
         else:
             # Build fresh tasks each sync so mapping objects have clean
@@ -236,14 +283,25 @@ class MegatronWeightExtractor(WeightExtractor):
             fresh_tasks = self.bridge.get_conversion_tasks(self.actor_module)
             for index_group in self.bucket_index_groups:
                 bucket_tasks = [fresh_tasks[i] for i in index_group]
-                for name, tensor in self.bridge.export_hf_weights(
+                for exported_weight in self.bridge.export_hf_weights(
                     self.actor_module,
                     show_progress=False,
                     conversion_tasks=bucket_tasks,
                 ):
-                    names.append(name)
-                    shapes.append(list(tensor.shape))
-                    dtype_names.append(dtype_name)
+                    name, tensor = self._unpack_hf_weight(exported_weight)
+                    if self.serialized_fp8_config is not None:
+                        metadata_iter = iter_serialized_fp8_metadata(
+                            name,
+                            list(tensor.shape),
+                            dtype,
+                            self.serialized_fp8_config,
+                        )
+                    else:
+                        metadata_iter = [(name, dtype, list(tensor.shape))]
+                    for out_name, out_dtype, out_shape in metadata_iter:
+                        names.append(out_name)
+                        shapes.append(out_shape)
+                        dtype_names.append(str(out_dtype).split(".")[-1])
                     del tensor
 
         self._weight_metadata_cache = {"names": names, "dtype_names": dtype_names, "shapes": shapes}
@@ -257,6 +315,28 @@ class MegatronWeightExtractor(WeightExtractor):
             self._init_param_buckets()
         self._buckets_initialized = True
 
+    def _iter_sync_tensors(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        dtype: torch.dtype,
+        device: int,
+        pending_shared_fp8_groups: dict[str, dict[str, tuple[str, torch.Tensor]]],
+    ):
+        if self.serialized_fp8_config is not None:
+            tensor = tensor.to(device=device, non_blocking=True)
+            group = shared_blockwise_fp8_group(name)
+            if group is not None:
+                group_key, shard = group
+                pending = pending_shared_fp8_groups.setdefault(group_key, {})
+                pending[shard] = (name, tensor)
+                if all(required_shard in pending for required_shard in ("b", "a")):
+                    ready = pending_shared_fp8_groups.pop(group_key)
+                    return iter_shared_blockwise_fp8_tensors(ready, dtype, self.serialized_fp8_config)
+                return []
+            return iter_serialized_fp8_tensors(name, tensor, dtype, self.serialized_fp8_config)
+        return [(name, tensor.to(device=device, dtype=dtype, non_blocking=True))]
+
     def extract_weights(self, dtype: torch.dtype):
         """Extract weights from Megatron model.
 
@@ -268,6 +348,7 @@ class MegatronWeightExtractor(WeightExtractor):
         """
         self._ensure_buckets_initialized()
         device = torch.cuda.current_device()
+        pending_shared_fp8_groups: dict[str, dict[str, tuple[str, torch.Tensor]]] = {}
 
         if not self.enable_bucketing:
             # No bucketing: yield one chunk per parameter
@@ -277,15 +358,25 @@ class MegatronWeightExtractor(WeightExtractor):
                 conversion_tasks=None,
             )
 
-            for name, tensor in hf_params_generator:
-                tensor = tensor.to(device=device, dtype=dtype, non_blocking=True)
+            for exported_weight in hf_params_generator:
+                name, tensor = self._unpack_hf_weight(exported_weight)
+                tensor_iter = self._iter_sync_tensors(name, tensor, dtype, device, pending_shared_fp8_groups)
 
-                yield WeightChunk(
-                    names=[name],
-                    dtypes=[str(dtype)],
-                    shapes=[list(tensor.shape)],
-                    tensors=[tensor],
-                )
+                names = []
+                dtypes = []
+                shapes = []
+                tensors = []
+                for out_name, out_tensor in tensor_iter:
+                    out_tensor = out_tensor.contiguous()
+                    names.append(out_name)
+                    dtypes.append(str(out_tensor.dtype))
+                    shapes.append(list(out_tensor.shape))
+                    tensors.append(out_tensor)
+
+                if tensors:
+                    yield WeightChunk(names=names, dtypes=dtypes, shapes=shapes, tensors=tensors)
+            if pending_shared_fp8_groups:
+                raise ValueError(f"Incomplete serialized FP8 shared groups: {sorted(pending_shared_fp8_groups)}")
         else:
             # Build fresh tasks each sync so mapping objects have clean
             # PP-collective caches; reuse the pre-computed bucket structure.
@@ -305,14 +396,16 @@ class MegatronWeightExtractor(WeightExtractor):
                 shapes = []
                 tensors = []
 
-                for name, tensor in hf_params_generator:
-                    # Move to device and convert dtype
-                    tensor = tensor.to(device=device, dtype=dtype, non_blocking=True)
+                for exported_weight in hf_params_generator:
+                    name, tensor = self._unpack_hf_weight(exported_weight)
+                    tensor_iter = self._iter_sync_tensors(name, tensor, dtype, device, pending_shared_fp8_groups)
 
-                    names.append(name)
-                    dtypes_list.append(str(dtype))
-                    shapes.append(list(tensor.shape))
-                    tensors.append(tensor)
+                    for out_name, out_tensor in tensor_iter:
+                        out_tensor = out_tensor.contiguous()
+                        names.append(out_name)
+                        dtypes_list.append(str(out_tensor.dtype))
+                        shapes.append(list(out_tensor.shape))
+                        tensors.append(out_tensor)
 
                 # Yield one chunk containing all parameters in this bucket
                 if tensors:
@@ -322,6 +415,8 @@ class MegatronWeightExtractor(WeightExtractor):
                         shapes=shapes,
                         tensors=tensors,
                     )
+            if pending_shared_fp8_groups:
+                raise ValueError(f"Incomplete serialized FP8 shared groups: {sorted(pending_shared_fp8_groups)}")
 
 
 class MegatronWorker:
@@ -789,6 +884,13 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         """
         Initialize the model, optimizer, and scheduler for the policy worker.
         """
+        # Ensure the TE Float8BlockScaling amax_epsilon floor is applied before any
+        # model construction / FP8 recipe build (guaranteed before make_megatron_module
+        # below, which is the earliest point a recipe/quantizer can be built via
+        # fp8_model_init). Idempotent with the module-import call; no-op unless
+        # NVTE_FP8_BLOCK_AMAX_EPSILON is set > 0.
+        apply_fp8_block_amax_epsilon_patch()
+
         # initialize the bridge and provider objects
         self.init_configs(
             model_path,
@@ -903,8 +1005,10 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         all_loss_fn_outputs: List[Dict[str, Any]] = []
 
         self._drop_pixel_values_on_non_first_pp_stage(data)
-        # Move data to GPU
-        data.to(torch.cuda.current_device())
+        # The H100 colocated path keeps the DP shard CPU-resident and moves each
+        # microbatch inside Megatron's forward_step to avoid a large extra HBM copy.
+        if not _env_flag("SKYRL_CPU_RESIDENT_POLICY_MICROBATCH", False):
+            data.to(torch.cuda.current_device())
 
         # Build micro-batch dicts expected by forward_backward_mini_batch
         micro_buffer = []
@@ -1016,8 +1120,10 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         all_metrics = defaultdict(list)
 
         self._drop_pixel_values_on_non_first_pp_stage(data)
-        # Move data to GPU
-        data.to(torch.cuda.current_device())
+        # The H100 colocated path keeps the DP shard CPU-resident and moves each
+        # microbatch inside Megatron's forward_step to avoid a large extra HBM copy.
+        if not _env_flag("SKYRL_CPU_RESIDENT_POLICY_MICROBATCH", False):
+            data.to(torch.cuda.current_device())
 
         use_token_batching = self.cfg.max_tokens_per_microbatch > 0
 
@@ -1201,6 +1307,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         """
         if self.optimizer is None:
             raise RuntimeError("optim_step called but policy.inference_only_init=True (no optimizer constructed)")
+
         grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
 
         # Reset counter for next accumulation cycle
@@ -1257,6 +1364,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             enable_bucketing=True,
             bucket_size_threshold_GB=inference_engine_cfg.weight_transfer_threshold_cuda_ipc_GB,
             training_dtype=torch.bfloat16 if self.cfg.bf16 else torch.float32,
+            fp8_weight_sync_mode=inference_engine_cfg.fp8_weight_sync_mode,
         )
 
     async def _save_lora_adapters_and_sync(

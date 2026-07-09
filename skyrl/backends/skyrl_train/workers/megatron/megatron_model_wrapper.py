@@ -29,6 +29,7 @@ from skyrl.backends.skyrl_train.distributed.megatron.model_utils import (
     vocab_parallel_entropy_packed_sequences,
 )
 from skyrl.backends.skyrl_train.distributed.megatron.packing_utils import is_fp8_enabled
+from skyrl.backends.skyrl_train.training_batch import TensorList
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
     PolicyLossRegistry,
     compute_approx_kl,
@@ -80,6 +81,23 @@ def _build_packed_targets(
     packed_indices = cu_padded[:-1].unsqueeze(1) + token_offsets
     targets[packed_indices[attention_mask]] = sequences[attention_mask]
     return targets.unsqueeze(0)
+
+
+def _copy_tensor_tree_to_device(value: Any, device: int) -> Any:
+    """Move tensors nested inside a microbatch dict to the active CUDA device."""
+    if torch.is_tensor(value) or isinstance(value, TensorList):
+        return value.to(device=device, non_blocking=True)
+    if isinstance(value, dict):
+        return {key: _copy_tensor_tree_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_tensor_tree_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_copy_tensor_tree_to_device(item, device) for item in value)
+    return value
+
+
+def _copy_tensor_dict_to_device(batch: Dict[str, Any], device: int) -> Dict[str, Any]:
+    return {key: _copy_tensor_tree_to_device(value, device) for key, value in batch.items()}
 
 
 def _fused_lm_head_output_processor(**kwargs):
@@ -145,6 +163,7 @@ class MegatronModelWrapper:
             )
 
         config = get_model_config(self.actor_module[0])
+        self.fp8_enabled = is_fp8_enabled(getattr(config, "fp8", None))
         # This is set to None by default: https://github.com/NVIDIA/Megatron-LM/blob/07b22a05136a3cb08ece05f7de38cf6aeeb165fb/megatron/core/model_parallel_config.py#L95
         # use the build in finalize_model_grads function to all reduce gradients across parallelism dimensions
         config.finalize_model_grads_func = finalize_model_grads
@@ -281,7 +300,7 @@ class MegatronModelWrapper:
             return torch.tensor(0.0, device=token_logprobs.device), {"log_probs": token_logprobs}
 
         def forward_step(batch_iter, model):
-            batch = next(batch_iter)
+            batch = _copy_tensor_dict_to_device(next(batch_iter), torch.cuda.current_device())
 
             model_config = get_model_config(model)
             fp8_enabled = is_fp8_enabled(getattr(model_config, "fp8", None))
@@ -292,6 +311,7 @@ class MegatronModelWrapper:
                     batch["attention_mask"],
                     model_config=model_config,
                     remove_microbatch_padding=self.remove_microbatch_padding,
+                    fp8_enabled=fp8_enabled,
                 )
 
             sequences = batch["sequences"]
@@ -546,7 +566,7 @@ class MegatronModelWrapper:
                     inference_only=False,
                     cp_group=None,
                     chunk_size=self.cfg.logprobs_chunk_size,  # chunk seq dim to bound peak memory
-                )
+            )
 
             action_log_probs = token_logprobs[:, -num_actions:]
 
@@ -645,10 +665,16 @@ class MegatronModelWrapper:
                         loss_mask,
                         mpu.get_context_parallel_group(),
                         sub_seq_lengths=data.get("sub_seq_lengths_list"),
+                        chunk_size=self.cfg.vocab_entropy_chunk_size,
+                        chunk_memory_mb=self.cfg.vocab_entropy_chunk_memory_mb,
                     )
                 else:
                     action_logits = logits[:, -num_actions - 1 : -1, :]
-                    entropy_BS = vocab_parallel_entropy(action_logits)
+                    entropy_BS = vocab_parallel_entropy(
+                        action_logits,
+                        chunk_size=self.cfg.vocab_entropy_chunk_size,
+                        chunk_memory_mb=self.cfg.vocab_entropy_chunk_memory_mb,
+                    )
                     entropy = masked_mean(entropy_BS, loss_mask)
                     entropy_for_loss = entropy
 
@@ -734,7 +760,7 @@ class MegatronModelWrapper:
             # (can be left, or right) as it uses attention_mask to locate real tokens. Same thing
             # for recover_left_padding and setup_per_microbatch_replay_forward. Especially relevant
             # after this PR https://github.com/NovaSky-AI/SkyRL/pull/1285.
-            batch = next(batch_iter)
+            batch = _copy_tensor_dict_to_device(next(batch_iter), torch.cuda.current_device())
 
             model_config = get_model_config(model)
             fp8_enabled = is_fp8_enabled(getattr(model_config, "fp8", None))
@@ -745,6 +771,7 @@ class MegatronModelWrapper:
                     batch["attention_mask"],
                     model_config=model_config,
                     remove_microbatch_padding=self.remove_microbatch_padding,
+                    fp8_enabled=fp8_enabled,
                 )
 
             sequences = batch["sequences"]

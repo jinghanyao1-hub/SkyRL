@@ -3,11 +3,13 @@ vLLM Server Actor - Ray actor running a vLLM OpenAI-compatible API server.
 """
 
 import asyncio
+import gc
 import logging
 import os
+import socket
 import time
 from argparse import Namespace
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import uvicorn
@@ -334,6 +336,93 @@ class VLLMServerActor(ServerActorProtocol):
         # /update_weights, /get_world_size) registered by the RLHF router when
         # VLLM_SERVER_DEV_MODE=1.
 
+        def _process_used_hbm_bytes(device: int, gpu_uuid: Optional[str]) -> Dict[str, Any]:
+            """Return this process' NVML memory on one visible CUDA device, if available."""
+            try:
+                import pynvml
+
+                pynvml.nvmlInit()
+                if gpu_uuid:
+                    try:
+                        handle = pynvml.nvmlDeviceGetHandleByUUID(gpu_uuid.encode("ascii"))
+                    except TypeError:
+                        handle = pynvml.nvmlDeviceGetHandleByUUID(gpu_uuid)
+                else:
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(device)
+
+                processes = []
+                for getter_name in ("nvmlDeviceGetComputeRunningProcesses", "nvmlDeviceGetGraphicsRunningProcesses"):
+                    getter = getattr(pynvml, getter_name, None)
+                    if getter is None:
+                        continue
+                    try:
+                        processes.extend(getter(handle))
+                    except Exception:
+                        pass
+
+                current_pid = os.getpid()
+                for proc in processes:
+                    if int(proc.pid) == current_pid:
+                        used = int(getattr(proc, "usedGpuMemory", 0) or 0)
+                        return {"process_used_bytes": used, "nvml_used_bytes": used}
+                return {"process_used_bytes": 0, "nvml_used_bytes": 0}
+            except Exception as exc:
+                return {"nvml_error": repr(exc)}
+
+        def _cuda_memory_stats() -> Dict[str, Any]:
+            """Collect process-local CUDA allocator stats for all visible devices."""
+            import torch
+
+            record: Dict[str, Any] = {
+                "hostname": socket.gethostname(),
+                "pid": os.getpid(),
+                "cuda_available": torch.cuda.is_available(),
+            }
+            if not torch.cuda.is_available():
+                return record
+
+            device_records: List[Dict[str, Any]] = []
+            for device in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(device)
+                raw_gpu_uuid = getattr(props, "uuid", None)
+                gpu_uuid = raw_gpu_uuid if isinstance(raw_gpu_uuid, str) else str(raw_gpu_uuid) if raw_gpu_uuid else None
+                torch.cuda.synchronize(device)
+                free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+                device_record: Dict[str, Any] = {
+                    "device": device,
+                    "gpu_name": getattr(props, "name", None),
+                    "gpu_uuid": gpu_uuid,
+                    "allocated_bytes": int(torch.cuda.memory_allocated(device)),
+                    "reserved_bytes": int(torch.cuda.memory_reserved(device)),
+                    "free_bytes": int(free_bytes),
+                    "total_bytes": int(total_bytes),
+                }
+                device_record.update(_process_used_hbm_bytes(device, gpu_uuid))
+                device_records.append(device_record)
+
+            record["device_count"] = len(device_records)
+            record["devices"] = device_records
+            for key in ("allocated_bytes", "reserved_bytes", "process_used_bytes", "nvml_used_bytes"):
+                record[key] = max((int(device.get(key, 0) or 0) for device in device_records), default=0)
+            return record
+
+        def _release_cuda_memory() -> Dict[str, Any]:
+            """Release process-local Python and CUDA allocator caches, then return memory stats."""
+            import torch
+
+            gc.collect()
+            if torch.cuda.is_available():
+                for device in range(torch.cuda.device_count()):
+                    with torch.cuda.device(device):
+                        torch.cuda.synchronize(device)
+                        torch.cuda.empty_cache()
+                        try:
+                            torch.cuda.ipc_collect()
+                        except RuntimeError:
+                            pass
+                        torch.cuda.synchronize(device)
+            return _cuda_memory_stats()
+
         @app.post("/reset_prefix_cache")
         async def _reset_prefix_cache(request: Request):
             """Reset the prefix cache, optionally resetting in-flight requests too."""
@@ -344,6 +433,16 @@ class VLLMServerActor(ServerActorProtocol):
             reset_running_requests = data.get("reset_running_requests", False)
             await engine.reset_prefix_cache(reset_running_requests=reset_running_requests)
             return {"status": "ok"}
+
+        @app.post("/cuda_memory_stats")
+        async def _cuda_memory_stats_endpoint():
+            """Return process-local CUDA/NVML memory stats."""
+            return _cuda_memory_stats()
+
+        @app.post("/release_cuda_memory")
+        async def _release_cuda_memory_endpoint():
+            """Run process-local CUDA cache cleanup and return post-cleanup memory stats."""
+            return _release_cuda_memory()
 
         @app.post("/skyrl/v1/load_lora_adapter")
         async def _skyrl_load_lora_adapter(request: Request):

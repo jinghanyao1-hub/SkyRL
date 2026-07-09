@@ -3,10 +3,30 @@
 import pytest
 
 from skyrl.backends.skyrl_train.inference_servers.utils import (
+    _apply_serialized_fp8_weight_sync_defaults,
     build_vllm_cli_args,
     resolve_policy_model_name,
 )
 from skyrl.train.config import SkyRLTrainConfig
+
+
+def test_serialized_fp8_weight_sync_defaults_configure_vllm_checkpoint_fp8():
+    cfg = SkyRLTrainConfig()
+    ie_cfg = cfg.generator.inference_engine
+    ie_cfg.fp8_weight_sync_mode = "serialized_blockwise"
+    engine_kwargs = {"hf_overrides": {"rope_theta": 10000.0}}
+
+    _apply_serialized_fp8_weight_sync_defaults(ie_cfg, engine_kwargs)
+
+    assert engine_kwargs["quantization"] == "fp8"
+    assert engine_kwargs["load_format"] == "dummy"
+    assert engine_kwargs["hf_overrides"]["rope_theta"] == 10000.0
+    assert engine_kwargs["hf_overrides"]["quantization_config"] == {
+        "quant_method": "fp8",
+        "fmt": "e4m3",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+    }
 
 
 @pytest.mark.vllm

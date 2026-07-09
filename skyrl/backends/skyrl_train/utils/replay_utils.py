@@ -229,6 +229,7 @@ def setup_per_microbatch_replay_forward(
     attention_mask: torch.Tensor,
     model_config,
     remove_microbatch_padding: bool = False,
+    fp8_enabled: bool = False,
 ) -> None:
     """Set up RouterReplay for a single micro-batch, aligning indices
     with the left-padding-removed token layout that the MoE layer sees.

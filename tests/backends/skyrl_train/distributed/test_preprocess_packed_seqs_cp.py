@@ -92,6 +92,16 @@ def _stub_megatron_modules():
 class TestPreprocessPackedSeqsShortSequencesCP:
     """preprocess_packed_seqs must not crash when sequences are shorter than align_size."""
 
+    def test_fp8_alignment_rule_preserves_tp1_and_uses_local_128_for_tp_gt_1(self):
+        """TP>1 FP8 needs each local sequence-parallel token shard 128-aligned."""
+        from skyrl.backends.skyrl_train.distributed.megatron.packing_utils import (
+            get_packed_seq_align_size,
+        )
+
+        assert get_packed_seq_align_size(tp_size=1, cp_size=1, fp8_enabled=True) == 16
+        assert get_packed_seq_align_size(tp_size=2, cp_size=1, fp8_enabled=True) == 256
+        assert get_packed_seq_align_size(tp_size=2, cp_size=2, fp8_enabled=True) == 512
+
     @pytest.mark.parametrize(
         "tp_size,cp_size,real_tokens",
         [
@@ -142,3 +152,69 @@ class TestPreprocessPackedSeqsShortSequencesCP:
                 assert result_ids.shape[1] % 16 == 0
                 assert packed_params.max_seqlen_q % (16 * cp_size) == 0
                 assert packed_params.qkv_format == "thd"
+
+    def test_remove_left_padding_tp1_aligns_only_for_fp8(self):
+        """Dense TP1 Megatron forwards keep the historical 16-aligned FP8 slabs."""
+        from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
+            remove_left_padding,
+        )
+
+        input_ids = torch.arange(7000).unsqueeze(0)
+        attention_mask = torch.zeros((1, 7000), dtype=torch.bool)
+        attention_mask[0, :6541] = True
+        position_ids = torch.arange(7000).unsqueeze(0)
+
+        with patch("skyrl.backends.skyrl_train.distributed.megatron.megatron_utils.mpu") as mock_mpu:
+            mock_mpu.get_tensor_model_parallel_world_size.return_value = 1
+            mock_mpu.get_context_parallel_world_size.return_value = 1
+
+            bf16_ids, bf16_mask, _ = remove_left_padding(
+                input_ids, attention_mask, position_ids, fp8_enabled=False
+            )
+            fp8_ids, fp8_mask, _ = remove_left_padding(input_ids, attention_mask, position_ids, fp8_enabled=True)
+
+        assert bf16_ids.shape == (1, 6541)
+        assert int(bf16_mask.sum().item()) == 6541
+        assert fp8_ids.shape == (1, 6544)
+        assert int(fp8_mask.sum().item()) == 6541
+
+    def test_remove_left_padding_tp_gt_1_fp8_aligns_local_token_shard_to_128(self):
+        """TP>1 FP8 pads enough for TE's local sequence-parallel all-gather input."""
+        from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
+            remove_left_padding,
+        )
+
+        input_ids = torch.arange(9000).unsqueeze(0)
+        attention_mask = torch.zeros((1, 9000), dtype=torch.bool)
+        attention_mask[0, :8594] = True
+        position_ids = torch.arange(9000).unsqueeze(0)
+
+        with patch("skyrl.backends.skyrl_train.distributed.megatron.megatron_utils.mpu") as mock_mpu:
+            mock_mpu.get_tensor_model_parallel_world_size.return_value = 2
+            mock_mpu.get_context_parallel_world_size.return_value = 1
+
+            fp8_ids, fp8_mask, _ = remove_left_padding(input_ids, attention_mask, position_ids, fp8_enabled=True)
+
+        assert fp8_ids.shape == (1, 8704)
+        assert int(fp8_mask.sum().item()) == 8594
+
+    def test_remove_left_padding_tp_gt_1_fp8_aligns_observed_h100_failure(self):
+        """Regression for 9B TP2 H100 failure: 8552 -> 8704, not 8576."""
+        from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
+            remove_left_padding,
+        )
+
+        input_ids = torch.arange(9000).unsqueeze(0)
+        attention_mask = torch.zeros((1, 9000), dtype=torch.bool)
+        attention_mask[0, :8552] = True
+        position_ids = torch.arange(9000).unsqueeze(0)
+
+        with patch("skyrl.backends.skyrl_train.distributed.megatron.megatron_utils.mpu") as mock_mpu:
+            mock_mpu.get_tensor_model_parallel_world_size.return_value = 2
+            mock_mpu.get_context_parallel_world_size.return_value = 1
+
+            fp8_ids, fp8_mask, _ = remove_left_padding(input_ids, attention_mask, position_ids, fp8_enabled=True)
+
+        assert fp8_ids.shape == (1, 8704)
+        assert int(fp8_mask.sum().item()) == 8552
+        assert fp8_ids.shape[1] % (128 * 2) == 0

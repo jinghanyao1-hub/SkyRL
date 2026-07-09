@@ -199,6 +199,7 @@ class MegatronStrategy(DistributedStrategy):
         See :meth:`offload_to_cpu` for why the grad-buffer half is decoupled
         from optimizer existence.
         """
+        torch.cuda.empty_cache()
         if backload_model:
             load_megatron_model_to_gpu(model)
         if backload_optimizer:
@@ -206,6 +207,7 @@ class MegatronStrategy(DistributedStrategy):
             if optimizer is not None:
                 load_megatron_optimizer(optimizer)
         torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
     def backward(self, loss: torch.Tensor, model, optimizer: optim.Optimizer, **kwargs) -> None:
         raise NotImplementedError()

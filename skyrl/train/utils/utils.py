@@ -15,10 +15,10 @@ import torch
 from loguru import logger
 from ray.util.placement_group import (
     PlacementGroup,
-    PlacementGroupSchedulingStrategy,
     placement_group,
     placement_group_table,
 )
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from skyrl.env_vars import (
     SKYRL_DUMP_INFRA_LOG_TO_STDOUT,
@@ -27,6 +27,38 @@ from skyrl.env_vars import (
     SKYRL_RAY_PG_TIMEOUT_IN_S,
 )
 from skyrl.train.config.config import SkyRLTrainConfig
+
+
+def get_skyrl_node_resource() -> tuple[str, float] | None:
+    """Return the optional Ray node resource used to pin placement groups."""
+    resource_name = os.environ.get("SKYRL_NODE_RESOURCE")
+    if not resource_name:
+        return None
+
+    try:
+        amount = float(os.environ.get("SKYRL_NODE_RESOURCE_AMOUNT", "0.001"))
+    except ValueError as exc:
+        raise ValueError("SKYRL_NODE_RESOURCE_AMOUNT must be a float") from exc
+
+    if amount <= 0:
+        raise ValueError("SKYRL_NODE_RESOURCE_AMOUNT must be positive")
+    return resource_name, amount
+
+
+def apply_skyrl_node_resource(bundles: list[dict]) -> list[dict]:
+    """Add the optional node resource to each placement-group bundle."""
+    node_resource = get_skyrl_node_resource()
+    if node_resource is None:
+        return bundles
+
+    resource_name, amount = node_resource
+    logger.info(f"Pinning placement group bundles with Ray resource {resource_name}={amount}")
+    pinned_bundles = []
+    for bundle in bundles:
+        pinned = dict(bundle)
+        pinned[resource_name] = pinned.get(resource_name, 0) + amount
+        pinned_bundles.append(pinned)
+    return pinned_bundles
 
 
 class Timer:
@@ -353,6 +385,12 @@ def validate_cfg(cfg: SkyRLTrainConfig):
     sequence_mask_metric = off_policy_correction.sequence_mask_metric
 
     uses_off_policy_correction = tis_ratio_type is not None or sequence_mask_metric is not None
+
+    if cfg.trainer.algorithm.use_current_policy_logprobs_as_old:
+        raise ValueError(
+            "`trainer.algorithm.use_current_policy_logprobs_as_old=True` is not part of the PR-ready FP8 stack. "
+            "Keep this compatibility-only key set to false."
+        )
 
     if uses_off_policy_correction:
         # Validate tis_ratio_type
@@ -682,7 +720,9 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
             ]
         )
     max_num_gpus_per_node = max(gpu_counts) if gpu_counts else 1
-    if not peer_access_supported(max_num_gpus_per_node=max_num_gpus_per_node):
+    if os.environ.get("SKYRL_SKIP_PEER_ACCESS_CHECK") == "1":
+        logger.info("Skipping peer access check because SKYRL_SKIP_PEER_ACCESS_CHECK=1")
+    elif not peer_access_supported(max_num_gpus_per_node=max_num_gpus_per_node):
         logger.info("Peer access is not supported on this node type, disabling NCCL P2P and SHM")
         env_vars["NCCL_P2P_DISABLE"] = "1"
         env_vars["NCCL_SHM_DISABLE"] = "1"
@@ -720,9 +760,50 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         logger.info(f"Exporting `PYTHONPATH` to ray runtime env: {os.environ['PYTHONPATH']}")
         env_vars["PYTHONPATH"] = os.environ["PYTHONPATH"]
 
+    if os.environ.get("SKYRL_PATH_EXPORT") == "1":
+        logger.info(f"Exporting `PATH` to ray runtime env: {os.environ['PATH']}")
+        env_vars["PATH"] = os.environ["PATH"]
+
+    for var_name in [
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "CUDNN_HOME",
+        "CUDNN_PATH",
+        "NVRTC_HOME",
+        "NVRTC_PATH",
+        "CURAND_HOME",
+        "CURAND_PATH",
+        "CUBLAS_HOME",
+        "CUBLAS_PATH",
+        "CUDART_HOME",
+        "CUDART_PATH",
+    ]:
+        if value := os.environ.get(var_name):
+            logger.info(f"Exporting `{var_name}` to ray runtime env: {value}")
+            env_vars[var_name] = value
+
     if pg_timeout := os.environ.get("SKYRL_RAY_PG_TIMEOUT_IN_S"):
         logger.info(f"Exporting `SKYRL_RAY_PG_TIMEOUT_IN_S` to ray runtime env: {pg_timeout}")
         env_vars["SKYRL_RAY_PG_TIMEOUT_IN_S"] = pg_timeout
+
+    if node_resource := os.environ.get("SKYRL_NODE_RESOURCE"):
+        logger.info(f"Exporting `SKYRL_NODE_RESOURCE` to ray runtime env: {node_resource}")
+        env_vars["SKYRL_NODE_RESOURCE"] = node_resource
+        if node_amount := os.environ.get("SKYRL_NODE_RESOURCE_AMOUNT"):
+            env_vars["SKYRL_NODE_RESOURCE_AMOUNT"] = node_amount
+
+    if skip_peer_access := os.environ.get("SKYRL_SKIP_PEER_ACCESS_CHECK"):
+        env_vars["SKYRL_SKIP_PEER_ACCESS_CHECK"] = skip_peer_access
+
+    for var_name in [
+        "SKYRL_RESET_PREFIX_CACHE_BEFORE_SLEEP",
+        "SKYRL_INFERENCE_SLEEP_LEVEL",
+        "SKYRL_CPU_RESIDENT_POLICY_MICROBATCH",
+        "SKYRL_OFFLOAD_EMPTY_CACHE_AFTER_CPU_OFFLOAD",
+        "SKYRL_SKIP_FINAL_SYNC_WHEN_DONE",
+    ]:
+        if value := os.environ.get(var_name):
+            logger.info(f"Exporting `{var_name}` to ray runtime env: {value}")
+            env_vars[var_name] = value
 
     # Health-check timeout for the inference server actor. Forwarded so `VLLMServerActor.start`
     # sees the override.
@@ -731,6 +812,11 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
             f"Exporting `SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S` to ray runtime env: {health_timeout}"
         )
         env_vars["SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S"] = health_timeout
+
+    # Opt-in TE Float8BlockScaling amax_epsilon floor, forwarded to Megatron worker
+    # actors (fixes FP8 blockwise MoE wgrad grad_norm=inf from zero-amax blocks).
+    if amax_eps := os.environ.get("NVTE_FP8_BLOCK_AMAX_EPSILON"):
+        env_vars["NVTE_FP8_BLOCK_AMAX_EPSILON"] = amax_eps
 
     return env_vars
 

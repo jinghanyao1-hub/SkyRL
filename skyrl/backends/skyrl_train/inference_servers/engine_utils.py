@@ -43,6 +43,24 @@ def build_engine_runtime_env(
     through as ``runtime_env``.
     """
     env_vars: Dict[str, str] = {}
+    for var_name in [
+        "LD_LIBRARY_PATH",
+        "PYTHONPATH",
+        "PATH",
+        "CUDNN_HOME",
+        "CUDNN_PATH",
+        "NVRTC_HOME",
+        "NVRTC_PATH",
+        "CURAND_HOME",
+        "CURAND_PATH",
+        "CUBLAS_HOME",
+        "CUBLAS_PATH",
+        "CUDART_HOME",
+        "CUDART_PATH",
+        "NVTE_FP8_BLOCK_AMAX_EPSILON",
+    ]:
+        if value := os.environ.get(var_name):
+            env_vars[var_name] = value
     if use_expandable_segments:
         env_vars["PYTORCH_CUDA_ALLOC_CONF"] = _alloc_conf_with_expandable_segments()
     if extra_env_vars:

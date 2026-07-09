@@ -843,6 +843,9 @@ class SFTTrainer:
         """
         # Imported lazily to avoid a circular import: ``collators`` imports
         # ``collate_sft_batch`` from this module.
+        from skyrl.backends.skyrl_train.distributed.megatron.packing_utils import (
+            is_fp8_enabled,
+        )
         from skyrl.train.dataset.collators import DefaultCollator, PackedDataCollator
 
         if self.sft_cfg.use_sequence_packing:

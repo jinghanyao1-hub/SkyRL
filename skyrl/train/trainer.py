@@ -69,6 +69,7 @@ from skyrl.train.generators.utils import (
 )
 from skyrl.train.utils import (
     Timer,
+    apply_skyrl_node_resource,
     get_ray_pg_ready_with_timeout,
     trainer_utils,
 )
@@ -182,6 +183,43 @@ class RayPPOTrainer:
         """Build a CallbackInput and dispatch the given event to all callbacks."""
         cb_input = self._build_callback_input(**fields)
         getattr(self._callback_handler, event_name)(self, cb_input, self._training_control)
+
+    async def _sleep_inference_engine_for_training(self) -> None:
+        """Sleep colocated rollout engines, with optional cache cleanup for tight H100 memory."""
+        placement_cfg = self.cfg.trainer.placement
+        if (
+            getattr(placement_cfg, "colocated_inference_memory_barrier", False)
+            and hasattr(self.inference_engine_client, "sleep_for_training")
+        ):
+            await self.inference_engine_client.sleep_for_training(
+                phase="training",
+                level=getattr(placement_cfg, "colocated_inference_sleep_level", 2),
+                residual_hbm_threshold_gb=getattr(
+                    placement_cfg, "colocated_inference_residual_hbm_threshold_gb", 2.0
+                ),
+                timeout_s=getattr(placement_cfg, "colocated_inference_memory_barrier_timeout_s", 30.0),
+                poll_s=getattr(placement_cfg, "colocated_inference_memory_barrier_poll_s", 1.0),
+                enabled=True,
+                hard_evict_on_breach=getattr(placement_cfg, "colocated_inference_hard_evict_on_breach", False),
+            )
+            return
+
+        reset_cache = os.environ.get("SKYRL_RESET_PREFIX_CACHE_BEFORE_SLEEP", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if reset_cache:
+            await self.inference_engine_client.reset_prefix_cache(reset_running_requests=False)
+
+        sleep_level_raw = os.environ.get("SKYRL_INFERENCE_SLEEP_LEVEL", "2")
+        try:
+            sleep_level = int(sleep_level_raw)
+        except ValueError:
+            logger.warning("Invalid SKYRL_INFERENCE_SLEEP_LEVEL=%r; using level=2", sleep_level_raw)
+            sleep_level = 2
+        await self.inference_engine_client.sleep(level=sleep_level)
 
     @property
     def has_critic(self) -> bool:
@@ -332,7 +370,6 @@ class RayPPOTrainer:
                             self._vllm_metrics_scraper.pause()
                     with Timer("step", self.all_timings):
                         # for colocate_all=true, inference engine is always on GPU when starting the training step
-
                         # 0. truncate data to have even shards
                         rand_prompts = self._remove_tail_data(rand_prompts)
                         generator_input, uids = prepare_generator_input(
@@ -369,7 +406,7 @@ class RayPPOTrainer:
 
                         if self.colocate_all:
                             # if we are not continuing sampling, we sleep the inference engine
-                            await self.inference_engine_client.sleep()
+                            await self._sleep_inference_engine_for_training()
 
                         # The train rollout for this step is done generating; close
                         # its metrics window. ``vllm/eval/*`` is collected separately
@@ -542,7 +579,7 @@ class RayPPOTrainer:
 
         pbar.close()
         if self.colocate_all:
-            await self.inference_engine_client.sleep()
+            await self._sleep_inference_engine_for_training()
 
         # Decrement global step by 1 to stop at the last global step
         # We use the global step value in callbacks when training finishes,
@@ -697,6 +734,7 @@ class RayPPOTrainer:
                     }
                     for _ in range(cfg.trainer.placement.policy_num_nodes)
                 ]
+                bundles = apply_skyrl_node_resource(bundles)
                 raw_pg = placement_group(bundles, strategy="PACK")
                 get_ray_pg_ready_with_timeout(raw_pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
                 pg = ResolvedPlacementGroup(raw_pg)
@@ -1244,9 +1282,9 @@ class RayPPOTrainer:
     def _skip_policy_forward(self, training_input: TrainingInputBatch) -> bool:
         """Whether the policy forward pass producing the "old" logprobs can be skipped.
 
-        Safe only when the loss optimizes against rollout logprobs and nothing else reads the
-        old logprobs: rollout logprobs are present (these losses fall back to old logprobs
-        without them), the KL reward penalty is off, and off-policy correction is disabled.
+        Safe when the loss optimizes against rollout logprobs and nothing else reads the old
+        logprobs: rollout logprobs are present (these losses fall back to old logprobs without
+        them), the KL reward penalty is off, and off-policy correction is disabled.
         """
         algorithm = self.cfg.trainer.algorithm
         return (

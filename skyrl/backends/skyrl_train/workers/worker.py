@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import logging
 import os
 import socket
@@ -16,10 +17,10 @@ from loguru import logger
 from omegaconf import OmegaConf
 from ray import ObjectRef
 from ray.util.placement_group import (
-    PlacementGroupSchedulingStrategy,
     placement_group,
     placement_group_table,
 )
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel
@@ -63,6 +64,7 @@ from skyrl.train.config import TrainerConfig
 from skyrl.train.dataset.replay_buffer import Experience
 from skyrl.train.utils.utils import (
     ResolvedPlacementGroup,
+    apply_skyrl_node_resource,
     configure_ray_worker_logging,
     get_ray_pg_ready_with_timeout,
     ray_noset_visible_devices,
@@ -243,9 +245,83 @@ class Worker(DistributedTorchRayActor):
         """Initialize worker state (model, and optimizer if applicable) on worker."""
         raise NotImplementedError()
 
-    def empty_cache(self) -> None:
-        """Empty GPU memory cache on Worker's CUDA device"""
+    def _get_own_nvml_used_bytes(self, device: int) -> Dict[str, Any]:
+        """Return this worker process' NVML memory on the current CUDA device, if available."""
+        try:
+            import pynvml
+
+            props = torch.cuda.get_device_properties(device)
+            raw_gpu_uuid = getattr(props, "uuid", None)
+            gpu_uuid = raw_gpu_uuid if isinstance(raw_gpu_uuid, str) else str(raw_gpu_uuid) if raw_gpu_uuid else None
+            pynvml.nvmlInit()
+            if gpu_uuid:
+                try:
+                    handle = pynvml.nvmlDeviceGetHandleByUUID(gpu_uuid.encode("ascii"))
+                except TypeError:
+                    handle = pynvml.nvmlDeviceGetHandleByUUID(gpu_uuid)
+            else:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(device)
+
+            processes = []
+            for getter_name in ("nvmlDeviceGetComputeRunningProcesses", "nvmlDeviceGetGraphicsRunningProcesses"):
+                getter = getattr(pynvml, getter_name, None)
+                if getter is None:
+                    continue
+                try:
+                    processes.extend(getter(handle))
+                except Exception:
+                    pass
+            current_pid = os.getpid()
+            for proc in processes:
+                if int(proc.pid) == current_pid:
+                    return {"nvml_used_bytes": int(getattr(proc, "usedGpuMemory", 0) or 0)}
+            return {"nvml_used_bytes": 0}
+        except Exception as exc:
+            return {"nvml_error": repr(exc)}
+
+    def cuda_memory_stats(self) -> Dict[str, Any]:
+        """Return best-effort CUDA/NVML memory stats for this worker process."""
+        record: Dict[str, Any] = {
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+            "cuda_available": torch.cuda.is_available(),
+        }
+        if not torch.cuda.is_available():
+            return record
+
+        device = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(device)
+        raw_gpu_uuid = getattr(props, "uuid", None)
+        gpu_uuid = raw_gpu_uuid if isinstance(raw_gpu_uuid, str) else str(raw_gpu_uuid) if raw_gpu_uuid else None
+        torch.cuda.synchronize(device)
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        record.update(
+            {
+                "device": device,
+                "gpu_name": getattr(props, "name", None),
+                "gpu_uuid": gpu_uuid,
+                "allocated_bytes": torch.cuda.memory_allocated(device),
+                "reserved_bytes": torch.cuda.memory_reserved(device),
+                "free_bytes": free_bytes,
+                "total_bytes": total_bytes,
+            }
+        )
+        record.update(self._get_own_nvml_used_bytes(device))
+        return record
+
+    def empty_cache(self) -> Dict[str, Any]:
+        """Empty GPU memory cache on Worker's CUDA device and return post-cleanup stats."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.ipc_collect()
+            except RuntimeError:
+                pass
+            torch.cuda.synchronize()
+        return self.cuda_memory_stats()
 
     def _set_expandable_segments(self, enabled: bool) -> None:
         """Toggle PyTorch's CUDA ``expandable_segments`` allocator at runtime.
@@ -567,6 +643,11 @@ class PPORayActorGroup:
         self.colocate_all = colocate_all
         self.sequence_parallel_size = sequence_parallel_size
         self.record_memory = record_memory
+        self._pg = pg
+        self._num_gpus_per_actor = num_gpus_per_actor
+        self._last_init_model_args = None
+        self._last_init_model_kwargs = None
+        self._last_dp_size: Optional[int] = None
         self._initiate_actors(pg, num_gpus_per_actor)
 
     def _initiate_actors(self, pg: Optional[ResolvedPlacementGroup], num_gpus_per_actor: float):
@@ -603,6 +684,7 @@ class PPORayActorGroup:
         # If no PG provided, create one internally
         if raw_pg is None and self._num_gpus_per_node > 1:
             bundles = [{"GPU": self._num_gpus_per_node, "CPU": self._num_gpus_per_node} for _ in range(self._num_nodes)]
+            bundles = apply_skyrl_node_resource(bundles)
             if self._resources:
                 resources_name = list(self._resources.keys())[0]
                 for i in range(len(bundles)):
@@ -678,6 +760,8 @@ class PPORayActorGroup:
         ray.get([actor.init_worker_process_group.remote() for actor in self._actor_handlers])
         logger.info("Initialized process group for RayActorGroup")
         self.actor_infos = [ActorInfo(actor, ray.get(actor.get_mesh_rank.remote())) for actor in self._actor_handlers]
+        if self.actor_infos:
+            self._last_dp_size = self.actor_infos[0].rank.dp_size
         logger.info(f"Mesh Ranks: {[actor_info.rank for actor_info in self.actor_infos]}")
 
     def async_init_model(
@@ -691,7 +775,62 @@ class PPORayActorGroup:
         Returns:
             A list of ray object refs.
         """
+        self._last_init_model_args = args
+        self._last_init_model_kwargs = dict(kwargs)
         return [actor.init_model.remote(*args, **kwargs) for actor in self._actor_handlers]
+
+    @property
+    def is_shutdown(self) -> bool:
+        """Whether this actor group currently has live Ray actor handles."""
+        return len(getattr(self, "_actor_handlers", [])) == 0
+
+    def can_restore_init_model(self) -> bool:
+        """Return whether the actor group can be restarted and reinitialized."""
+        if self._last_init_model_args is None:
+            return False
+        model_path = None
+        if self._last_init_model_args:
+            model_path = self._last_init_model_args[0]
+        elif self._last_init_model_kwargs:
+            model_path = self._last_init_model_kwargs.get("model_path")
+        if model_path is None:
+            return True
+        if isinstance(model_path, str) and os.path.isabs(model_path) and not os.path.exists(model_path):
+            return False
+        return True
+
+    def get_dp_size(self) -> int:
+        """Return the current or last-known data-parallel size for this actor group."""
+        if self.actor_infos:
+            self._last_dp_size = self.actor_infos[0].rank.dp_size
+            return self._last_dp_size
+        if self._last_dp_size is None:
+            raise RuntimeError("Cannot determine data-parallel size before actor group initialization.")
+        return self._last_dp_size
+
+    def shutdown(self) -> None:
+        """Terminate all actors in this group so process-owned CUDA memory is released."""
+        if self.actor_infos:
+            self._last_dp_size = self.actor_infos[0].rank.dp_size
+        for actor in list(getattr(self, "_actor_handlers", [])):
+            try:
+                ray.kill(actor, no_restart=True)
+            except Exception as exc:
+                logger.warning(f"Failed to kill Ray actor during actor-group shutdown: {exc}")
+        self._actor_handlers = []
+        self.actor_infos = []
+
+    def restart_actors(self) -> None:
+        """Recreate the Ray actors and distributed process group for this actor group."""
+        if not self.is_shutdown:
+            self.shutdown()
+        self._initiate_actors(self._pg, self._num_gpus_per_actor)
+
+    def restore_init_model(self) -> None:
+        """Reinitialize actors with the last init_model arguments."""
+        if not self.can_restore_init_model():
+            raise RuntimeError("Cannot restore actor group: last init_model path is unavailable.")
+        ray.get(self.async_init_model(*self._last_init_model_args, **(self._last_init_model_kwargs or {})))
 
     def offload_to_cpu(self, nonblocking=False, offload_optimizer=True, offload_model=True):
         """Offload all worker state to CPU.
