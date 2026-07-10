@@ -60,6 +60,9 @@ from skyrl.backends.skyrl_train.weight_sync.serialized_fp8 import (
 from skyrl.backends.skyrl_train.workers.megatron._fp8_block_amax_epsilon_patch import (
     apply_fp8_block_amax_epsilon_patch,
 )
+from skyrl.backends.skyrl_train.workers.megatron.fp8_param import (
+    initialize_fp8_param_optimizer_masters,
+)
 from skyrl.backends.skyrl_train.workers.megatron.adapter_store import (
     AdapterStore,
     LoraSignature,
@@ -949,6 +952,20 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 self.cfg.policy.optimizer_config, self.cfg.policy.megatron_config.optimizer_config_kwargs
             )
             self.optimizer = get_megatron_optimizer(self.actor_module, optim_config)
+            fp8_param_masters = initialize_fp8_param_optimizer_masters(
+                self.optimizer,
+                fp8_param=bool(
+                    getattr(self.cfg.policy.megatron_config.transformer_config_kwargs, "fp8_param", False)
+                ),
+                fp8_param_gather=bool(
+                    getattr(self.cfg.policy.megatron_config.ddp_config, "fp8_param_gather", False)
+                ),
+            )
+            if fp8_param_masters:
+                logger.info(
+                    "Initialized {} persistent-FP8 optimizer master shard group(s) from loaded compute weights.",
+                    fp8_param_masters,
+                )
 
             # create scheduler
             self.scheduler = get_megatron_optimizer_param_scheduler(
