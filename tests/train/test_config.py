@@ -128,6 +128,13 @@ def test_cli_overrides_empty_args():
     assert cfg.trainer.seed == 42
 
 
+def test_cli_overrides_fp8_param_gather():
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        ["trainer.policy.megatron_config.ddp_config.fp8_param_gather=true"]
+    )
+    assert cfg.trainer.policy.megatron_config.ddp_config.fp8_param_gather is True
+
+
 def test_cli_overrides_plus_prefix_rejected():
     with pytest.raises(ValueError, match="The '\\+' prefix"):
         SkyRLTrainConfig.from_cli_overrides(["+new_field=value"])
