@@ -2,8 +2,10 @@ from types import SimpleNamespace
 
 import torch
 
-from skyrl.backends.skyrl_train.weight_sync.base import WeightChunk
-from skyrl.backends.skyrl_train.weight_sync.cuda_ipc_strategy import _iter_single_dtype_chunks
+from skyrl.backends.skyrl_train.weight_sync.base import (
+    WeightChunk,
+    iter_single_dtype_chunks,
+)
 from skyrl.backends.skyrl_train.weight_sync.serialized_fp8 import (
     SerializedFp8Config,
     batched_moe_expert_spec,
@@ -13,9 +15,9 @@ from skyrl.backends.skyrl_train.weight_sync.serialized_fp8 import (
     get_serialized_fp8_quantization_config,
     is_quantizable_weight,
     is_quantizable_weight_shape,
-    iter_shared_blockwise_fp8_tensors,
     iter_serialized_fp8_metadata,
     iter_serialized_fp8_tensors,
+    iter_shared_blockwise_fp8_tensors,
     scale_name_for_weight,
     shared_blockwise_fp8_group,
 )
@@ -266,7 +268,7 @@ def test_batched_moe_metadata_matches_tensor_emission():
         assert meta == emitted
 
 
-def test_cuda_ipc_chunks_are_split_by_actual_dtype_in_first_seen_order():
+def test_serialized_fp8_chunks_are_split_by_actual_dtype_in_first_seen_order():
     chunk = WeightChunk(
         names=["w0", "s0", "w1", "b0"],
         dtypes=["ignored", "ignored", "ignored", "ignored"],
@@ -279,7 +281,7 @@ def test_cuda_ipc_chunks_are_split_by_actual_dtype_in_first_seen_order():
         ],
     )
 
-    chunks = list(_iter_single_dtype_chunks(chunk))
+    chunks = list(iter_single_dtype_chunks(chunk))
 
     assert [subchunk.names for subchunk in chunks] == [["w0", "w1"], ["s0"], ["b0"]]
     assert [[tensor.dtype for tensor in subchunk.tensors] for subchunk in chunks] == [

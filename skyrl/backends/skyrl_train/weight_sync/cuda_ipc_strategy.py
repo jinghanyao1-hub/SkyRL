@@ -28,7 +28,12 @@ if TYPE_CHECKING:
 import torch
 from torch.multiprocessing.reductions import reduce_tensor
 
-from skyrl.backends.skyrl_train.weight_sync.base import WeightChunk, WeightUpdateRequest
+from skyrl.backends.skyrl_train.weight_sync.base import (
+    WeightChunk,
+    WeightUpdateRequest,
+    iter_single_dtype_chunks,
+    torch_dtype_name,
+)
 from skyrl.backends.skyrl_train.weight_sync.transfer_strategy import (
     WeightSyncInitInfo,
     WeightTransferSender,
@@ -57,40 +62,10 @@ class CudaIpcInitInfo(WeightSyncInitInfo):
 _IPC_REQUEST_END_MARKER = b"__END_OF_REQUEST__"
 
 
-def _dtype_name(dtype: torch.dtype) -> str:
-    return str(dtype).split(".")[-1]
-
-
-def _iter_single_dtype_chunks(chunk: WeightChunk) -> Iterable[WeightChunk]:
-    """Yield chunks whose tensors all share one dtype.
-
-    A logical checkpoint-format update may contain mixed dtypes, e.g. FP8
-    weights and FP32 ``weight_scale_inv`` tensors. Each packed CUDA IPC buffer
-    must still have one dtype, so split by actual tensor dtype while preserving
-    the first-seen dtype order.
-    """
-
-    by_dtype: Dict[torch.dtype, Dict[str, list]] = {}
-    dtype_order: list[torch.dtype] = []
-    for name, _dtype_str, shape, tensor in zip(chunk.names, chunk.dtypes, chunk.shapes, chunk.tensors):
-        dtype = tensor.dtype
-        if dtype not in by_dtype:
-            dtype_order.append(dtype)
-            by_dtype[dtype] = {"names": [], "dtypes": [], "shapes": [], "tensors": []}
-        group = by_dtype[dtype]
-        group["names"].append(name)
-        group["dtypes"].append(str(dtype))
-        group["shapes"].append(shape)
-        group["tensors"].append(tensor)
-
-    for dtype in dtype_order:
-        group = by_dtype[dtype]
-        yield WeightChunk(
-            names=group["names"],
-            dtypes=group["dtypes"],
-            shapes=group["shapes"],
-            tensors=group["tensors"],
-        )
+# Kept as private aliases for existing out-of-tree callers. The implementation
+# lives in ``base`` because NCCL and CUDA IPC must use identical partitioning.
+_dtype_name = torch_dtype_name
+_iter_single_dtype_chunks = iter_single_dtype_chunks
 
 
 @dataclass
@@ -249,7 +224,7 @@ class CudaIpcWeightTransferSender(WeightTransferSender):
         rank: int,
     ) -> None:
         dtype = chunk.tensors[0].dtype
-        dtype_name = _dtype_name(dtype)
+        dtype_name = torch_dtype_name(dtype)
         if any(tensor.dtype != dtype for tensor in chunk.tensors):
             raise ValueError("CUDA IPC packed chunks must contain a single tensor dtype")
 

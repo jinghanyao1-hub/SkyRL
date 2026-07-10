@@ -29,6 +29,13 @@ import torch
 from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
     LayerwiseReloadWorkerMixin,
 )
+from skyrl.backends.skyrl_train.inference_servers.vllm_compat import (
+    patch_vllm_fp8_kv_cache_sleep_wake,
+)
+
+# This module is resolved as vLLM's worker extension before each worker is
+# constructed, so the compatibility patch reaches every engine process.
+patch_vllm_fp8_kv_cache_sleep_wake()
 
 VLLM_NEW_INFERENCE_WORKER_EXTENSION_CLS = f"{__name__}.NewInferenceWorkerWrap"
 

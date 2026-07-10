@@ -2,7 +2,7 @@
 
 from dataclasses import asdict, dataclass, field
 from functools import cached_property
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterator, List
 
 import torch
 
@@ -104,3 +104,50 @@ class WeightChunk:
     def total_size_bytes(self) -> int:
         """Calculate total memory footprint in bytes."""
         return sum(t.numel() * t.element_size() for t in self.tensors)
+
+
+def torch_dtype_name(dtype: torch.dtype) -> str:
+    """Return the dtype spelling expected by vLLM weight-transfer metadata."""
+    return str(dtype).split(".")[-1]
+
+
+def iter_single_dtype_chunks(chunk: WeightChunk) -> Iterator[WeightChunk]:
+    """Split one logical chunk into dtype-homogeneous chunks.
+
+    Serialized FP8 checkpoint-format sync includes FP8 weights, FP32 block
+    scales, and BF16 tensors that intentionally remain unquantized. Both IPC
+    buffers and NCCL transfer calls must describe one concrete tensor dtype at
+    a time. Preserve the first-seen dtype order so every training rank and
+    every transport follows the same deterministic update sequence.
+    """
+    by_dtype: Dict[torch.dtype, Dict[str, list]] = {}
+    dtype_order: List[torch.dtype] = []
+
+    for name, _dtype_str, shape, tensor in zip(chunk.names, chunk.dtypes, chunk.shapes, chunk.tensors):
+        dtype = tensor.dtype
+        if dtype not in by_dtype:
+            dtype_order.append(dtype)
+            by_dtype[dtype] = {"names": [], "dtypes": [], "shapes": [], "tensors": []}
+        group = by_dtype[dtype]
+        group["names"].append(name)
+        group["dtypes"].append(str(dtype))
+        group["shapes"].append(shape)
+        group["tensors"].append(tensor)
+
+    for dtype in dtype_order:
+        group = by_dtype[dtype]
+        yield WeightChunk(
+            names=group["names"],
+            dtypes=group["dtypes"],
+            shapes=group["shapes"],
+            tensors=group["tensors"],
+        )
+
+
+def get_weight_chunk_metadata(chunk: WeightChunk) -> Dict[str, List]:
+    """Return vLLM metadata from the tensors that will actually be transferred."""
+    return {
+        "names": list(chunk.names),
+        "dtype_names": [torch_dtype_name(tensor.dtype) for tensor in chunk.tensors],
+        "shapes": [list(shape) for shape in chunk.shapes],
+    }

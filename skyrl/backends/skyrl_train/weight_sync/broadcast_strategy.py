@@ -7,7 +7,7 @@ from training workers to inference engines using NCCL/Gloo broadcast operations.
 import asyncio
 import socket
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
 if TYPE_CHECKING:
     from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
@@ -18,7 +18,12 @@ if TYPE_CHECKING:
 import ray
 import torch
 
-from skyrl.backends.skyrl_train.weight_sync.base import WeightChunk, WeightUpdateRequest
+from skyrl.backends.skyrl_train.weight_sync.base import (
+    WeightChunk,
+    WeightUpdateRequest,
+    get_weight_chunk_metadata,
+    iter_single_dtype_chunks,
+)
 from skyrl.backends.skyrl_train.weight_sync.transfer_strategy import (
     WeightSyncInitInfo,
     WeightTransferSender,
@@ -122,8 +127,9 @@ class BroadcastWeightTransferSender(WeightTransferSender):
 
         Args:
             chunks: Iterable of WeightChunk objects to send.
-            weight_metadata: Pre-computed metadata dict with "names", "dtype_names",
-                "shapes". Avoids materializing all chunks to collect metadata.
+            weight_metadata: Retained for interface compatibility. The NCCL path
+                derives metadata from each dtype-homogeneous emitted chunk so
+                serialized FP8 payloads cannot mix dtypes in one transfer.
         """
         await self._send_chunks_vllm_native(chunks, weight_metadata)
 
@@ -132,22 +138,13 @@ class BroadcastWeightTransferSender(WeightTransferSender):
         chunks: Iterable[WeightChunk],
         weight_metadata: Optional[Dict[str, list]] = None,
     ) -> None:
-        """Batched path: one update_weights call + trainer_send_weights (vLLM native).
+        """Batched path: one update per dtype-homogeneous chunk via vLLM NCCL.
 
         All ranks must evaluate the chunks iterator (extract_weights uses
-        collective all-gather internally). Only rank 0 sends the gathered
-        tensors to vLLM via the NCCL weight transfer engine.
+        collective all-gather internally). Rank 0 brackets every per-dtype
+        NCCL update in one layerwise-reload transaction while other ranks keep
+        advancing the extractor and therefore participate in its collectives.
         """
-        if weight_metadata is None:
-            raise ValueError(
-                "weight_metadata is required for vLLM native path. "
-                "Call weight_extractor.get_weight_metadata() and pass it to send_chunks."
-            )
-
-        def weight_iterator() -> Iterator[Tuple[str, torch.Tensor]]:
-            for chunk in chunks:
-                yield from zip(chunk.names, chunk.tensors)
-
         # Route via the skyrl wrap (start_weight_update + update_weights_nccl
         # + finish_weight_update) rather than vLLM's native /update_weights so
         # the receive is wrapped with set_current_vllm_config. Matches how
@@ -156,30 +153,35 @@ class BroadcastWeightTransferSender(WeightTransferSender):
         # patch lands (vllm-project/vllm weight-sync-fix).
         # https://github.com/vllm-project/vllm/pull/42577
         if torch.distributed.get_rank() == 0:
-            from vllm.distributed.weight_transfer.nccl_engine import (
-                NCCLWeightTransferEngine,
-            )
-
             await self._inference_client.start_weight_update(is_checkpoint_format=True)
 
-            update_info = {**weight_metadata, "packed": True}
-            update_task = asyncio.create_task(self._inference_client.update_weights_nccl(update_info))
+        for logical_chunk in chunks:
+            for chunk in iter_single_dtype_chunks(logical_chunk):
+                if torch.distributed.get_rank() == 0:
+                    await self._send_single_dtype_chunk_vllm_native(chunk)
 
-            # Run in thread so the HTTP update_task can progress concurrently
-            await asyncio.to_thread(
-                NCCLWeightTransferEngine.trainer_send_weights,
-                iterator=weight_iterator(),
-                trainer_args={"group": self._model_update_group, "packed": True},
-            )
-            await update_task
-
+        if torch.distributed.get_rank() == 0:
             await self._inference_client.finish_weight_update()
-        else:
-            # Non-rank-0 still needs to participate in the all-gather
-            for _ in weight_iterator():
-                pass
 
         torch.distributed.barrier()
+
+    async def _send_single_dtype_chunk_vllm_native(self, chunk: WeightChunk) -> None:
+        """Send one dtype-homogeneous chunk through vLLM's packed NCCL path."""
+        from vllm.distributed.weight_transfer.nccl_engine import (
+            NCCLWeightTransferEngine,
+        )
+
+        update_info = {**get_weight_chunk_metadata(chunk), "packed": True}
+        update_task = asyncio.create_task(self._inference_client.update_weights_nccl(update_info))
+
+        # Run in a thread so the receiver's collective_rpc request can enter
+        # vLLM concurrently with the matching trainer-side NCCL broadcast.
+        await asyncio.to_thread(
+            NCCLWeightTransferEngine.trainer_send_weights,
+            iterator=iter(zip(chunk.names, chunk.tensors)),
+            trainer_args={"group": self._model_update_group, "packed": True},
+        )
+        await update_task
 
     def teardown(self) -> None:
         """Destroy the process group used for weight transfer."""

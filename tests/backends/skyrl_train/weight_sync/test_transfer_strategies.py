@@ -1,4 +1,7 @@
+import asyncio
+
 import pytest
+import torch
 
 from skyrl.backends.skyrl_train.weight_sync import (
     BroadcastInitInfo,
@@ -9,6 +12,10 @@ from skyrl.backends.skyrl_train.weight_sync import (
     CudaIpcWeightUpdateRequest,
     LoraLoadRequest,
     get_transfer_strategy_cls,
+)
+from skyrl.backends.skyrl_train.weight_sync.base import WeightChunk
+from skyrl.backends.skyrl_train.weight_sync.broadcast_strategy import (
+    BroadcastWeightTransferSender,
 )
 from skyrl.train.config import InferenceEngineConfig
 
@@ -120,6 +127,63 @@ class TestBroadcastWeightUpdateRequest:
                 dtypes=["bfloat16"],
                 shapes=[[4096, 4096]],
             )
+
+
+def test_broadcast_sender_splits_mixed_dtype_serialized_fp8_chunk(monkeypatch):
+    """NCCL must receive one packed update per dtype within a reload transaction."""
+    import skyrl.backends.skyrl_train.weight_sync.broadcast_strategy as broadcast_module
+
+    class FakeInferenceClient:
+        def __init__(self):
+            self.events = []
+
+        async def start_weight_update(self, is_checkpoint_format):
+            self.events.append(("start", is_checkpoint_format))
+
+        async def finish_weight_update(self):
+            self.events.append(("finish",))
+
+    client = FakeInferenceClient()
+    sender = BroadcastWeightTransferSender(
+        init_info=BroadcastInitInfo(
+            master_addr="127.0.0.1",
+            master_port=12345,
+            rank_offset=1,
+            world_size=2,
+            override_existing_receiver=False,
+        ),
+        model_update_group=object(),
+        inference_client=client,
+    )
+    sent_chunks = []
+
+    async def record_chunk(chunk):
+        sent_chunks.append((list(chunk.names), [tensor.dtype for tensor in chunk.tensors]))
+
+    monkeypatch.setattr(sender, "_send_single_dtype_chunk_vllm_native", record_chunk)
+    monkeypatch.setattr(broadcast_module.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(broadcast_module.torch.distributed, "barrier", lambda: None)
+
+    mixed_chunk = WeightChunk(
+        names=["w0", "scale", "w1", "norm"],
+        dtypes=["ignored"] * 4,
+        shapes=[[4], [1], [8], [2]],
+        tensors=[
+            torch.empty((4,), dtype=torch.float8_e4m3fn),
+            torch.empty((1,), dtype=torch.float32),
+            torch.empty((8,), dtype=torch.float8_e4m3fn),
+            torch.empty((2,), dtype=torch.bfloat16),
+        ],
+    )
+
+    asyncio.run(sender._send_chunks_vllm_native(iter([mixed_chunk])))
+
+    assert client.events == [("start", True), ("finish",)]
+    assert sent_chunks == [
+        (["w0", "w1"], [torch.float8_e4m3fn, torch.float8_e4m3fn]),
+        (["scale"], [torch.float32]),
+        (["norm"], [torch.bfloat16]),
+    ]
 
 
 class TestCudaIpcWeightUpdateRequest:
