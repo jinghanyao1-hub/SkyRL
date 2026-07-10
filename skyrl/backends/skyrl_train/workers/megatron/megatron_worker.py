@@ -62,6 +62,7 @@ from skyrl.backends.skyrl_train.workers.megatron._fp8_block_amax_epsilon_patch i
 )
 from skyrl.backends.skyrl_train.workers.megatron.fp8_param import (
     initialize_fp8_param_optimizer_masters,
+    is_fp8_param_enabled,
 )
 from skyrl.backends.skyrl_train.workers.megatron.adapter_store import (
     AdapterStore,
@@ -954,8 +955,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             self.optimizer = get_megatron_optimizer(self.actor_module, optim_config)
             fp8_param_masters = initialize_fp8_param_optimizer_masters(
                 self.optimizer,
-                fp8_param=bool(
-                    getattr(self.cfg.policy.megatron_config.transformer_config_kwargs, "fp8_param", False)
+                fp8_param=is_fp8_param_enabled(
+                    self.cfg.policy.megatron_config.transformer_config_kwargs
                 ),
                 fp8_param_gather=bool(
                     getattr(self.cfg.policy.megatron_config.ddp_config, "fp8_param_gather", False)

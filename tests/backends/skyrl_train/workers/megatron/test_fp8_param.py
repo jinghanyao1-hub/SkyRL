@@ -2,6 +2,7 @@ import pytest
 
 from skyrl.backends.skyrl_train.workers.megatron.fp8_param import (
     initialize_fp8_param_optimizer_masters,
+    is_fp8_param_enabled,
 )
 
 
@@ -11,6 +12,12 @@ class _FakeOptimizer:
 
     def _copy_model_params_to_main_params(self):
         self.calls += 1
+
+
+def test_fp8_param_enablement_reads_skyrl_transformer_config_mapping():
+    assert is_fp8_param_enabled({"fp8_param": True})
+    assert not is_fp8_param_enabled({"fp8_param": False})
+    assert not is_fp8_param_enabled({})
 
 
 def test_fp8_param_master_initialization_reloads_each_chained_optimizer():

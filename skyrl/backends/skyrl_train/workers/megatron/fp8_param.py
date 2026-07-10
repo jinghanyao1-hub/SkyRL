@@ -1,6 +1,12 @@
 """Utilities for training with persistent Transformer Engine FP8 parameters."""
 
+from collections.abc import Mapping
 from typing import Any
+
+
+def is_fp8_param_enabled(transformer_config_kwargs: Mapping[str, Any]) -> bool:
+    """Read persistent-FP8 enablement from SkyRL's dictionary config."""
+    return bool(transformer_config_kwargs.get("fp8_param", False))
 
 
 def initialize_fp8_param_optimizer_masters(
